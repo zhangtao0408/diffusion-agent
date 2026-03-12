@@ -1,0 +1,9 @@
+features:
+{% for feature in features %}
+  - id: "{{ feature.id }}"
+    name: "{{ feature.name }}"
+    description: "{{ feature.description }}"
+    status: "{{ feature.status | default('pending') }}"
+    error: null
+    metadata: {}
+{% endfor %}
