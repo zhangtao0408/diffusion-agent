@@ -152,7 +152,7 @@ class TestE2ECheckScenario:
         _init_git_repo(repo_path)
         _write_file(repo_path, "utils.py", UTILS_PY)
 
-        result = _run_graph(repo_path)
+        _run_graph(repo_path)
 
         reports_dir = repo_path / ".diffusion_agent" / "reports"
         assert (reports_dir / "check-report.json").exists()

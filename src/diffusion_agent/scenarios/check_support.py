@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from diffusion_agent.scenarios import ScenarioBase
-from diffusion_agent.tools.code_scanner import Finding, PatternType, scan_directory
+from diffusion_agent.tools.code_scanner import Finding, scan_directory
 from diffusion_agent.tools.torch_npu_checker import (
     CheckResult,
     OpStatus,

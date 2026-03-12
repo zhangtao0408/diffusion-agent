@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from diffusion_agent.tools.code_scanner import (
-    Finding,
     PatternType,
     scan_directory,
     scan_file,

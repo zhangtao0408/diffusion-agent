@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-
-import pytest
 
 from diffusion_agent.tools.torch_npu_checker import (
     CheckResult,
