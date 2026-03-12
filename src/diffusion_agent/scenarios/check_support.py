@@ -30,6 +30,8 @@ class CheckReport:
     compatibility_results: list[CheckResult]
     summary_stats: dict[str, Any]
     recommendations: list[str]
+    torch_npu_version: str | None = None
+    op_matrix_source: str = "static"  # "static" | "dynamic"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -38,6 +40,8 @@ class CheckReport:
             "compatibility_results": [asdict(r) for r in self.compatibility_results],
             "summary_stats": self.summary_stats,
             "recommendations": self.recommendations,
+            "torch_npu_version": self.torch_npu_version,
+            "op_matrix_source": self.op_matrix_source,
         }
 
 
@@ -86,11 +90,16 @@ def _render_markdown(report: CheckReport) -> str:
         "# Ascend NPU Compatibility Check Report",
         "",
         f"**Verdict**: {report.verdict}",
+        f"**Op Matrix Source**: {report.op_matrix_source}",
+    ]
+    if report.torch_npu_version:
+        lines.append(f"**torch_npu Version**: {report.torch_npu_version}")
+    lines.extend([
         "",
         "## Summary Statistics",
         "",
         f"- Total findings: {report.summary_stats['total_findings']}",
-    ]
+    ])
     for ptype, count in report.summary_stats.get("by_pattern_type", {}).items():
         lines.append(f"  - {ptype}: {count}")
 
@@ -132,7 +141,8 @@ class CheckSupportScenario(ScenarioBase):
 
     def execute(self, state: dict[str, Any]) -> dict[str, Any]:
         repo_path = Path(state["repo_local_path"])
-        log.info("check_support_start", repo=str(repo_path))
+        npu_version: str | None = state.get("torch_npu_version")
+        log.info("check_support_start", repo=str(repo_path), npu_version=npu_version)
 
         # 1. Scan repo
         findings = scan_directory(repo_path)
@@ -140,7 +150,7 @@ class CheckSupportScenario(ScenarioBase):
 
         # 2. Extract unique pattern types and check each
         unique_patterns = list({f.pattern_type.value for f in findings})
-        results = [check_pattern(p) for p in unique_patterns]
+        results = [check_pattern(p, version=npu_version) for p in unique_patterns]
 
         # 3. Build report
         verdict = _determine_verdict(results)
@@ -153,6 +163,8 @@ class CheckSupportScenario(ScenarioBase):
             compatibility_results=results,
             summary_stats=summary_stats,
             recommendations=recommendations,
+            torch_npu_version=npu_version,
+            op_matrix_source="dynamic" if npu_version else "static",
         )
 
         # 4. Write report files

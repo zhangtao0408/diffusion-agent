@@ -34,6 +34,12 @@ def run(
     model_name: str = typer.Option(
         "unknown", "--model", "-m", help="Model name for identification"
     ),
+    npu_version: Optional[str] = typer.Option(
+        None,
+        "--npu-version",
+        help="torch_npu version to use for op support lookup (e.g. 2.8.0). "
+        "Auto-detected from NPU server if DA_NPU_SSH_HOST is set.",
+    ),
 ) -> None:
     """Run the diffusion agent pipeline."""
     settings = load_settings()
@@ -46,6 +52,16 @@ def run(
         typer.echo(f"Invalid scenario: {scenario}. Must be one of: {[s.value for s in Scenario]}")
         raise typer.Exit(1)
 
+    # Resolve torch_npu version (explicit > auto-detect > None)
+    resolved_version = npu_version
+    if resolved_version is None and settings.npu_ssh_host:
+        from diffusion_agent.tools.api_doc_fetcher import detect_torch_npu_version
+
+        detected = detect_torch_npu_version(settings.npu_ssh_host, settings.npu_conda_env)
+        if detected:
+            typer.echo(f"Auto-detected torch_npu version: {detected}")
+            resolved_version = detected
+
     # Build initial state
     initial_state: AgentState = {
         "scenario": scenario,
@@ -55,6 +71,9 @@ def run(
         "tool_results": [],
         "should_stop": False,
     }
+
+    if resolved_version:
+        initial_state["torch_npu_version"] = resolved_version
 
     if repo:
         initial_state["repo_url"] = repo

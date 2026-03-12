@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     llm_base_url: Optional[str] = None
     log_level: str = "INFO"
     work_dir: Path = Path("./workspace")
+    npu_ssh_host: Optional[str] = None
+    npu_conda_env: Optional[str] = None
 
     def get_work_dir(self) -> Path:
         self.work_dir.mkdir(parents=True, exist_ok=True)
