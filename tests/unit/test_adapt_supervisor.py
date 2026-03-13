@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from unittest.mock import MagicMock
+
 from diffusion_agent.adapt.supervisor import AdaptSupervisor
-from diffusion_agent.adapt.types import StopReason
+from diffusion_agent.adapt.types import ExecutionConfig, StopReason
+from diffusion_agent.adapt.workspace_sync import NoOpSync, SyncResult
 
 
 def _write(tmp_path: Path, name: str, content: str) -> Path:
@@ -138,3 +141,65 @@ class TestSupervisorWithGit:
         sup.run()
 
         assert repo.active_branch.name == "adapt/my-model"
+
+
+class TestSupervisorSync:
+    def test_noop_sync_by_default(self, tmp_path: Path) -> None:
+        sup = AdaptSupervisor(tmp_path, model_name="test", use_git=False)
+        assert isinstance(sup.sync, NoOpSync)
+
+    def test_injected_sync(self, tmp_path: Path) -> None:
+        mock_sync = MagicMock()
+        mock_sync.sync.return_value = SyncResult(success=True, mode="mock")
+        sup = AdaptSupervisor(tmp_path, model_name="test", use_git=False, workspace_sync=mock_sync)
+        assert sup.sync is mock_sync
+
+    def test_sync_called_on_batch_changes(self, tmp_path: Path) -> None:
+        _write(tmp_path, "model.py", "import torch\nx = tensor.cuda()\n")
+        mock_sync = MagicMock()
+        mock_sync.sync.return_value = SyncResult(success=True, mode="mock")
+
+        sup = AdaptSupervisor(tmp_path, model_name="test", use_git=False, workspace_sync=mock_sync)
+        sup.run()
+
+        # sync should have been called at least once (for batch changes)
+        assert mock_sync.sync.called
+        # First call should include the changed file
+        call_args = mock_sync.sync.call_args_list[0]
+        changed_files = call_args[0][0]  # first positional arg
+        assert any("model.py" in f for f in changed_files)
+
+    def test_sync_not_called_when_no_changes(self, tmp_path: Path) -> None:
+        _write(tmp_path, "model.py", "import os\nprint('hello')\n")
+        mock_sync = MagicMock()
+        mock_sync.sync.return_value = SyncResult(success=True, mode="mock")
+
+        sup = AdaptSupervisor(tmp_path, model_name="test", use_git=False, workspace_sync=mock_sync)
+        sup.run()
+
+        # No CUDA patterns → no patches → no sync
+        mock_sync.sync.assert_not_called()
+
+    def test_sync_from_ssh_execution_config(self, tmp_path: Path) -> None:
+        cfg = ExecutionConfig(
+            mode="ssh",
+            ssh_host="h.example.com",
+            remote_workdir="/data/repo",
+            sync_enabled=True,
+        )
+        sup = AdaptSupervisor(tmp_path, model_name="test", use_git=False, execution_config=cfg)
+        # Should have created an RsyncSync, not NoOpSync
+        from diffusion_agent.adapt.workspace_sync import RsyncSync
+        assert isinstance(sup.sync, RsyncSync)
+        assert sup.sync.config.host == "h.example.com"
+        assert sup.sync.config.remote_workdir == "/data/repo"
+
+    def test_sync_disabled_in_config(self, tmp_path: Path) -> None:
+        cfg = ExecutionConfig(
+            mode="ssh",
+            ssh_host="h.example.com",
+            remote_workdir="/data/repo",
+            sync_enabled=False,
+        )
+        sup = AdaptSupervisor(tmp_path, model_name="test", use_git=False, execution_config=cfg)
+        assert isinstance(sup.sync, NoOpSync)

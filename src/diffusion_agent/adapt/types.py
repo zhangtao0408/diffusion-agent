@@ -161,6 +161,14 @@ class ExecutionConfig:
     # Validation command (custom smoke command for model adaptation)
     validation_command: str | None = None
 
+    # Sync settings (used in SSH mode to push patched files before validation)
+    sync_enabled: bool = True  # automatically sync before remote validation
+    sync_exclude: list[str] = field(default_factory=lambda: [
+        "__pycache__", "*.pyc", ".git", "*.bak", ".diffusion_agent",
+    ])
+    sync_timeout: int = 60
+    sync_delete: bool = False  # whether to --delete files on remote
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "mode": self.mode,
@@ -172,6 +180,8 @@ class ExecutionConfig:
             "pre_commands": self.pre_commands,
             "timeout": self.timeout,
             "validation_command": self.validation_command,
+            "sync_enabled": self.sync_enabled,
+            "sync_timeout": self.sync_timeout,
         }
 
 

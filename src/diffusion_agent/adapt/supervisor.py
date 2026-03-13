@@ -31,6 +31,12 @@ from diffusion_agent.adapt.types import (
     StopReason,
     Verdict,
 )
+from diffusion_agent.adapt.workspace_sync import (
+    NoOpSync,
+    SyncResult,
+    WorkspaceSync,
+    create_workspace_sync,
+)
 from diffusion_agent.tools.code_migrator import RuleRegistry, create_default_registry
 from diffusion_agent.tools.code_scanner import Finding, scan_directory
 from diffusion_agent.utils.logging import get_logger
@@ -66,6 +72,7 @@ class AdaptSupervisor:
         conda_env: str | None = None,
         use_git: bool = True,
         execution_config: ExecutionConfig | None = None,
+        workspace_sync: WorkspaceSync | None = None,
     ) -> None:
         self.registry: RuleRegistry = create_default_registry()
         self.planner = AdaptPlanner(self.registry)
@@ -78,6 +85,23 @@ class AdaptSupervisor:
         )
         self.judge = AdaptJudge()
         self.git = GitMemory(repo_path) if use_git else None
+
+        # Workspace sync: explicit injection > config-derived > noop
+        if workspace_sync is not None:
+            self.sync: WorkspaceSync = workspace_sync
+        elif execution_config and execution_config.mode == "ssh" and execution_config.sync_enabled:
+            self.sync = create_workspace_sync(
+                mode=execution_config.mode,
+                ssh_host=execution_config.ssh_host,
+                ssh_user=execution_config.ssh_user,
+                ssh_port=execution_config.ssh_port,
+                remote_workdir=execution_config.remote_workdir,
+                exclude_patterns=execution_config.sync_exclude,
+                sync_timeout=execution_config.sync_timeout,
+                delete=execution_config.sync_delete,
+            )
+        else:
+            self.sync = NoOpSync()
 
         self.state = AdaptationState(
             repo_path=repo_path,
@@ -135,6 +159,29 @@ class AdaptSupervisor:
         )
         return self.state
 
+    # ----- Workspace sync -----
+
+    def _sync_to_remote(self, changed_files: list[str]) -> SyncResult:
+        """Sync changed files to the remote workspace before validation.
+
+        Returns a SyncResult.  On failure, logs a warning but does not
+        halt the loop — the caller decides how to handle it.
+        """
+        result = self.sync.sync(changed_files, self.state.repo_path)
+        if result.success:
+            log.info(
+                "supervisor_sync_ok",
+                mode=result.mode,
+                files=result.files_requested,
+            )
+        else:
+            log.warning(
+                "supervisor_sync_failed",
+                mode=result.mode,
+                error=result.error,
+            )
+        return result
+
     # ----- Phase A: Batch rule application -----
 
     def _apply_batch_rules(self, findings: list[Finding]) -> None:
@@ -166,6 +213,9 @@ class AdaptSupervisor:
                     source="rule",
                 )
                 self.git.commit_iteration(0, batch_hyp, Verdict.IMPROVED)
+
+            # Sync batch-patched files to remote before iterative validation
+            self._sync_to_remote(patch_result.files_changed)
 
             log.info(
                 "supervisor_batch_done",
@@ -222,6 +272,10 @@ class AdaptSupervisor:
         # 4. Apply patch (patch worker)
         patch_result = self.worker.apply_patch(hypothesis, findings)
 
+        # 4b. Sync patched files to remote before validation
+        if patch_result.files_changed:
+            self._sync_to_remote(patch_result.files_changed)
+
         # 5. Run validation AFTER patch
         run_after = self.runner.run_syntax_check(
             [f for f in task.target_files if Path(f).exists()]
@@ -249,6 +303,9 @@ class AdaptSupervisor:
             # Rollback
             if self.git and snapshot:
                 self.git.rollback_to(snapshot)
+            # Re-sync rolled-back state so remote workspace is consistent
+            if patch_result.files_changed:
+                self._sync_to_remote(patch_result.files_changed)
             task.status = "pending"  # can retry with different hypothesis
 
         # 8. Record iteration
