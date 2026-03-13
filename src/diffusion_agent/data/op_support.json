@@ -51,6 +51,11 @@
     "pin_memory": {"status": "supported", "note": "pin_memory is supported on NPU"},
     "cuda_stream": {"status": "partial", "note": "Replace torch.cuda.Stream with torch.npu.Stream"},
     "cuda_event": {"status": "partial", "note": "Replace torch.cuda.Event with torch.npu.Event"},
-    "cuda_graph": {"status": "unsupported", "note": "CUDA Graphs not supported on NPU. Remove or use alternative"}
+    "cuda_graph": {"status": "unsupported", "note": "CUDA Graphs not supported on NPU. Remove or use alternative"},
+    "flash_attn": {"status": "unsupported", "note": "flash_attn is a CUDA-only library. Use torch_npu's built-in attention or SDPA"},
+    "xformers": {"status": "unsupported", "note": "xformers is a CUDA-only library. Use torch_npu's built-in attention or SDPA"},
+    "bfloat16": {"status": "supported", "note": "bfloat16 is supported on Ascend 910B"},
+    "distributed": {"status": "partial", "note": "torch.distributed is supported but must use HCCL backend instead of NCCL"},
+    "sdpa": {"status": "supported", "note": "scaled_dot_product_attention is supported on NPU via torch_npu"}
   }
 }

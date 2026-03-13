@@ -40,6 +40,16 @@ def run(
         help="torch_npu version to use for op support lookup (e.g. 2.8.0). "
         "Auto-detected from NPU server if DA_NPU_SSH_HOST is set.",
     ),
+    run_baselines: bool = typer.Option(
+        False,
+        "--run-baselines",
+        help="Also run CI baseline checks (LTX-2, Wan2.2) for comparison.",
+    ),
+    runtime_verify: bool = typer.Option(
+        False,
+        "--runtime-verify",
+        help="Run runtime verification of critical ops on the NPU server.",
+    ),
 ) -> None:
     """Run the diffusion agent pipeline."""
     settings = load_settings()
@@ -89,12 +99,42 @@ def run(
 
     result = graph.invoke(initial_state)
 
+    # Post-pipeline: runtime verification
+    if runtime_verify and scenario == "check" and settings.npu_ssh_host:
+        from diffusion_agent.tools.npu_verifier import run_basic_checks
+
+        typer.echo("\nRunning NPU runtime verification...")
+        runtime_results = run_basic_checks(settings.npu_ssh_host, settings.npu_conda_env)
+        passed = sum(1 for r in runtime_results if r.passed)
+        typer.echo(f"Runtime verification: {passed}/{len(runtime_results)} ops passed")
+
+    # Post-pipeline: baseline comparison
+    if run_baselines and scenario == "check" and resolved_version:
+        from diffusion_agent.tools.baseline_runner import CI_BASELINES, load_or_run_baseline
+
+        typer.echo("\nRunning CI baseline checks...")
+        for bname in CI_BASELINES:
+            typer.echo(f"  Checking baseline: {bname}...")
+            baseline_result = load_or_run_baseline(bname, resolved_version)
+            typer.echo(f"  {bname}: {baseline_result.get('verdict', 'unknown')} "
+                       f"({baseline_result.get('total_findings', 0)} findings)")
+
     typer.echo(f"\nCompleted. Phase: {result.get('phase', 'unknown')}")
     completed = result.get("completed_features", [])
     if completed:
         typer.echo(f"Features completed: {len(completed)}")
     if result.get("error"):
         typer.echo(f"Error: {result['error']}")
+
+    # Exit code based on verdict (for check scenario)
+    if scenario == "check":
+        tool_results = result.get("tool_results", [])
+        if tool_results:
+            verdict = tool_results[-1].get("verdict", "compatible")
+            if verdict == "incompatible":
+                raise typer.Exit(2)
+            elif verdict == "partially_compatible":
+                raise typer.Exit(1)
 
 
 if __name__ == "__main__":

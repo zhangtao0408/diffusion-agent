@@ -191,3 +191,30 @@ class TestCheckReport:
         assert d["verdict"] == "compatible"
         assert isinstance(d["findings"], list)
         assert isinstance(d["summary_stats"], dict)
+        assert d["model_name"] == "unknown"
+        assert d["blocking_issues"] == []
+        assert d["suspected_root_causes"] == []
+        assert d["runtime_results"] is None
+        assert d["baseline_comparison"] is None
+
+    def test_to_dict_with_enhanced_fields(self) -> None:
+        report = CheckReport(
+            verdict="partially_compatible",
+            findings=[],
+            compatibility_results=[],
+            summary_stats={"total_findings": 0, "by_pattern_type": {}, "by_compatibility": {}},
+            recommendations=["Replace NCCL with HCCL"],
+            model_name="test-model",
+            repo_url="https://github.com/test/repo",
+            repo_local_path="/tmp/repo",
+            torch_npu_version="2.8.0",
+            api_reference_branch="v2.8.0",
+            blocking_issues=["flash_attn: CUDA-only"],
+            suspected_root_causes=["Uses flash_attn"],
+        )
+        d = report.to_dict()
+        assert d["model_name"] == "test-model"
+        assert d["repo_url"] == "https://github.com/test/repo"
+        assert d["api_reference_branch"] == "v2.8.0"
+        assert len(d["blocking_issues"]) == 1
+        assert len(d["suspected_root_causes"]) == 1

@@ -18,6 +18,11 @@ class PatternType(str, Enum):
     CUDA_API = "cuda_api"         # torch.cuda.*
     FLOAT64 = "float64"           # float64 / double
     NCCL = "nccl"                 # nccl backend
+    FLASH_ATTN = "flash_attn"     # flash_attn imports
+    XFORMERS = "xformers"         # xformers imports
+    BFLOAT16 = "bfloat16"         # bfloat16 usage
+    DISTRIBUTED = "distributed"   # torch.distributed usage
+    SDPA = "sdpa"                 # scaled_dot_product_attention
 
 
 @dataclass
@@ -66,6 +71,14 @@ class _PatternVisitor(ast.NodeVisitor):
             elif attr == "double":
                 self._add(node, PatternType.FLOAT64)
 
+            # scaled_dot_product_attention
+            elif attr == "scaled_dot_product_attention":
+                self._add(node, PatternType.SDPA)
+
+            # init_process_group (distributed)
+            elif attr == "init_process_group":
+                self._add(node, PatternType.DISTRIBUTED)
+
         # torch.cuda.* calls  (e.g. torch.cuda.is_available())
         if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Attribute):
             val = node.func.value
@@ -79,7 +92,7 @@ class _PatternVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _check_to_call(self, node: ast.Call) -> None:
-        """Detect .to("cuda"), .to("cuda:0"), .to(device), .to(torch.float64)."""
+        """Detect .to("cuda"), .to("cuda:0"), .to(device), .to(torch.float64), .to(torch.bfloat16)."""
         for arg in node.args:
             # String literal containing "cuda"
             if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
@@ -90,10 +103,13 @@ class _PatternVisitor(ast.NodeVisitor):
             if isinstance(arg, ast.Name) and arg.id == "device":
                 self._add(node, PatternType.CUDA_TO)
                 return
-            # torch.float64
+            # torch.float64 / torch.bfloat16
             if isinstance(arg, ast.Attribute) and isinstance(arg.value, ast.Name):
                 if arg.value.id == "torch" and arg.attr == "float64":
                     self._add(node, PatternType.FLOAT64)
+                    return
+                if arg.value.id == "torch" and arg.attr == "bfloat16":
+                    self._add(node, PatternType.BFLOAT16)
                     return
 
     # --- torch.cuda.* attribute access (non-call) --------------------------
@@ -105,11 +121,33 @@ class _PatternVisitor(ast.NodeVisitor):
                 pass  # visit_Call handles all torch.cuda.* calls
         self.generic_visit(node)
 
-    # --- string literals: "nccl", "float64" --------------------------------
+    # --- string literals: "nccl", "float64", "bfloat16" ---------------------
     def visit_Constant(self, node: ast.Constant) -> None:  # noqa: N802
         if isinstance(node.value, str):
             if node.value == "nccl":
                 self._add(node, PatternType.NCCL)
+            elif node.value == "bfloat16":
+                self._add(node, PatternType.BFLOAT16)
+        self.generic_visit(node)
+
+    # --- imports: flash_attn, xformers, torch.distributed -----------------
+    def visit_Import(self, node: ast.Import) -> None:  # noqa: N802
+        for alias in node.names:
+            name = alias.name
+            if name == "flash_attn" or name.startswith("flash_attn."):
+                self._add(node, PatternType.FLASH_ATTN)
+            elif name == "xformers" or name.startswith("xformers."):
+                self._add(node, PatternType.XFORMERS)
+            elif name == "torch.distributed":
+                self._add(node, PatternType.DISTRIBUTED)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
+        module = node.module or ""
+        if module == "flash_attn" or module.startswith("flash_attn."):
+            self._add(node, PatternType.FLASH_ATTN)
+        elif module == "xformers" or module.startswith("xformers."):
+            self._add(node, PatternType.XFORMERS)
         self.generic_visit(node)
 
 

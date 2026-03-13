@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -25,13 +25,32 @@ log = get_logger(__name__)
 class CheckReport:
     """Structured report produced by the check_support scenario."""
 
+    # Results
     verdict: str  # "compatible" | "partially_compatible" | "incompatible"
     findings: list[Finding]
     compatibility_results: list[CheckResult]
     summary_stats: dict[str, Any]
     recommendations: list[str]
+
+    # Identification
+    model_name: str = "unknown"
+    repo_url: str | None = None
+    repo_local_path: str = ""
+
+    # Source tracking
     torch_npu_version: str | None = None
+    api_reference_branch: str | None = None
     op_matrix_source: str = "static"  # "static" | "dynamic"
+
+    # Evidence
+    blocking_issues: list[str] = field(default_factory=list)
+    suspected_root_causes: list[str] = field(default_factory=list)
+
+    # Runtime verification (if available)
+    runtime_results: list[dict[str, Any]] | None = None
+
+    # CI baseline comparison
+    baseline_comparison: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -40,8 +59,16 @@ class CheckReport:
             "compatibility_results": [asdict(r) for r in self.compatibility_results],
             "summary_stats": self.summary_stats,
             "recommendations": self.recommendations,
+            "model_name": self.model_name,
+            "repo_url": self.repo_url,
+            "repo_local_path": self.repo_local_path,
             "torch_npu_version": self.torch_npu_version,
+            "api_reference_branch": self.api_reference_branch,
             "op_matrix_source": self.op_matrix_source,
+            "blocking_issues": self.blocking_issues,
+            "suspected_root_causes": self.suspected_root_causes,
+            "runtime_results": self.runtime_results,
+            "baseline_comparison": self.baseline_comparison,
         }
 
 
@@ -71,6 +98,33 @@ def _build_recommendations(results: list[CheckResult]) -> list[str]:
     return recs
 
 
+def _build_blocking_issues(results: list[CheckResult]) -> list[str]:
+    """Extract issues that prevent running on NPU (unsupported ops)."""
+    return [
+        f"{r.op_name}: {r.note}"
+        for r in results
+        if r.status is OpStatus.UNSUPPORTED and r.note
+    ]
+
+
+def _build_suspected_root_causes(
+    findings: list[Finding], results: list[CheckResult],
+) -> list[str]:
+    """Identify likely root causes of incompatibility."""
+    causes: list[str] = []
+    finding_types = {f.pattern_type.value for f in findings}
+
+    if "flash_attn" in finding_types:
+        causes.append("Uses flash_attn (CUDA-only). Replace with SDPA or torch_npu attention.")
+    if "xformers" in finding_types:
+        causes.append("Uses xformers (CUDA-only). Replace with SDPA or torch_npu attention.")
+    if "nccl" in finding_types:
+        causes.append("Uses NCCL backend. Replace with HCCL for Ascend NPU.")
+    if "float64" in finding_types:
+        causes.append("Uses float64/double. NPU supports float32/float16/bfloat16 only.")
+    return causes
+
+
 def _build_summary_stats(
     findings: list[Finding], results: list[CheckResult]
 ) -> dict[str, Any]:
@@ -89,11 +143,20 @@ def _render_markdown(report: CheckReport) -> str:
     lines = [
         "# Ascend NPU Compatibility Check Report",
         "",
+        f"**Model**: {report.model_name}",
+    ]
+    if report.repo_url:
+        lines.append(f"**Repository**: {report.repo_url}")
+    lines.append(f"**Local Path**: {report.repo_local_path}")
+    lines.extend([
         f"**Verdict**: {report.verdict}",
         f"**Op Matrix Source**: {report.op_matrix_source}",
-    ]
+    ])
     if report.torch_npu_version:
         lines.append(f"**torch_npu Version**: {report.torch_npu_version}")
+    if report.api_reference_branch:
+        lines.append(f"**API Reference Branch**: {report.api_reference_branch}")
+
     lines.extend([
         "",
         "## Summary Statistics",
@@ -114,6 +177,16 @@ def _render_markdown(report: CheckReport) -> str:
         f"- Unknown: {compat.get('unknown', 0)}",
     ])
 
+    if report.blocking_issues:
+        lines.extend(["", "## Blocking Issues", ""])
+        for issue in report.blocking_issues:
+            lines.append(f"- {issue}")
+
+    if report.suspected_root_causes:
+        lines.extend(["", "## Suspected Root Causes", ""])
+        for cause in report.suspected_root_causes:
+            lines.append(f"- {cause}")
+
     if report.findings:
         lines.extend(["", "## Findings", ""])
         for f in report.findings:
@@ -123,6 +196,22 @@ def _render_markdown(report: CheckReport) -> str:
         lines.extend(["", "## Recommendations", ""])
         for rec in report.recommendations:
             lines.append(f"- {rec}")
+
+    if report.runtime_results:
+        lines.extend(["", "## Runtime Verification", ""])
+        for rv in report.runtime_results:
+            status = "PASS" if rv.get("passed") else "FAIL"
+            lines.append(f"- [{status}] {rv.get('op_name', 'unknown')}")
+            if rv.get("error"):
+                lines.append(f"  - Error: {rv['error']}")
+
+    if report.baseline_comparison:
+        lines.extend(["", "## Baseline Comparison", ""])
+        for bname, comp in report.baseline_comparison.items():
+            lines.append(f"### vs {bname}")
+            lines.append(f"- Shared patterns: {', '.join(comp.get('shared_patterns', [])) or 'none'}")
+            lines.append(f"- Target-only patterns: {', '.join(comp.get('target_only', [])) or 'none'}")
+            lines.append(f"- Baseline-only patterns: {', '.join(comp.get('baseline_only', [])) or 'none'}")
 
     lines.append("")
     return "\n".join(lines)
@@ -142,7 +231,15 @@ class CheckSupportScenario(ScenarioBase):
     def execute(self, state: dict[str, Any]) -> dict[str, Any]:
         repo_path = Path(state["repo_local_path"])
         npu_version: str | None = state.get("torch_npu_version")
+        model_name: str = state.get("model_name", "unknown")
+        repo_url: str | None = state.get("repo_url")
         log.info("check_support_start", repo=str(repo_path), npu_version=npu_version)
+
+        # Resolve API reference branch
+        api_ref_branch: str | None = None
+        if npu_version:
+            from diffusion_agent.tools.api_doc_fetcher import resolve_branch
+            api_ref_branch = resolve_branch(npu_version)
 
         # 1. Scan repo
         findings = scan_directory(repo_path)
@@ -156,6 +253,8 @@ class CheckSupportScenario(ScenarioBase):
         verdict = _determine_verdict(results)
         recommendations = _build_recommendations(results)
         summary_stats = _build_summary_stats(findings, results)
+        blocking_issues = _build_blocking_issues(results)
+        root_causes = _build_suspected_root_causes(findings, results)
 
         report = CheckReport(
             verdict=verdict,
@@ -163,8 +262,14 @@ class CheckSupportScenario(ScenarioBase):
             compatibility_results=results,
             summary_stats=summary_stats,
             recommendations=recommendations,
+            model_name=model_name,
+            repo_url=repo_url,
+            repo_local_path=str(repo_path),
             torch_npu_version=npu_version,
+            api_reference_branch=api_ref_branch,
             op_matrix_source="dynamic" if npu_version else "static",
+            blocking_issues=blocking_issues,
+            suspected_root_causes=root_causes,
         )
 
         # 4. Write report files
