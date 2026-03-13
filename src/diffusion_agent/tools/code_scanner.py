@@ -16,6 +16,7 @@ class PatternType(str, Enum):
     CUDA_CALL = "cuda_call"       # .cuda()
     CUDA_TO = "cuda_to"           # .to("cuda") / .to(device)
     CUDA_API = "cuda_api"         # torch.cuda.*
+    CUDA_DEVICE_STR = "cuda_device_str"  # "cuda" string literals (torch.device, defaults, etc.)
     FLOAT64 = "float64"           # float64 / double
     NCCL = "nccl"                 # nccl backend
     FLASH_ATTN = "flash_attn"     # flash_attn imports
@@ -41,6 +42,7 @@ class _PatternVisitor(ast.NodeVisitor):
         self.file_path = file_path
         self.lines = lines
         self.findings: list[Finding] = []
+        self._cuda_to_lines: set[int] = set()  # lines already reported as CUDA_TO
 
     def _add(self, node: ast.AST, ptype: PatternType) -> None:
         lineno = getattr(node, "lineno", 0)
@@ -98,6 +100,7 @@ class _PatternVisitor(ast.NodeVisitor):
             if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                 if "cuda" in arg.value:
                     self._add(node, PatternType.CUDA_TO)
+                    self._cuda_to_lines.add(getattr(node, "lineno", 0))
                     return
             # Variable named 'device'
             if isinstance(arg, ast.Name) and arg.id == "device":
@@ -121,13 +124,18 @@ class _PatternVisitor(ast.NodeVisitor):
                 pass  # visit_Call handles all torch.cuda.* calls
         self.generic_visit(node)
 
-    # --- string literals: "nccl", "float64", "bfloat16" ---------------------
+    # --- string literals: "nccl", "bfloat16", "cuda" ------------------------
     def visit_Constant(self, node: ast.Constant) -> None:  # noqa: N802
         if isinstance(node.value, str):
             if node.value == "nccl":
                 self._add(node, PatternType.NCCL)
             elif node.value == "bfloat16":
                 self._add(node, PatternType.BFLOAT16)
+            elif "cuda" in node.value:
+                # Avoid double-counting lines already caught as CUDA_TO
+                lineno = getattr(node, "lineno", 0)
+                if lineno not in self._cuda_to_lines:
+                    self._add(node, PatternType.CUDA_DEVICE_STR)
         self.generic_visit(node)
 
     # --- imports: flash_attn, xformers, torch.distributed -----------------

@@ -103,6 +103,25 @@ class TestFloat64:
 # PatternType: nccl
 # ---------------------------------------------------------------------------
 
+class TestCudaDeviceStr:
+    def test_torch_device_cuda(self, tmp_path: Path) -> None:
+        src = _write(tmp_path, "a.py", 'device = torch.device("cuda")\n')
+        findings = scan_file(src)
+        assert any(f.pattern_type == PatternType.CUDA_DEVICE_STR for f in findings)
+
+    def test_cuda_default_param(self, tmp_path: Path) -> None:
+        src = _write(tmp_path, "a.py", 'def foo(device="cuda"):\n    pass\n')
+        findings = scan_file(src)
+        assert any(f.pattern_type == PatternType.CUDA_DEVICE_STR for f in findings)
+
+    def test_not_double_counted_with_cuda_to(self, tmp_path: Path) -> None:
+        src = _write(tmp_path, "a.py", 'model.to("cuda")\n')
+        findings = scan_file(src)
+        # Should have CUDA_TO but NOT CUDA_DEVICE_STR for the same line
+        assert any(f.pattern_type == PatternType.CUDA_TO for f in findings)
+        assert not any(f.pattern_type == PatternType.CUDA_DEVICE_STR for f in findings)
+
+
 class TestNccl:
     def test_nccl_backend(self, tmp_path: Path) -> None:
         src = _write(tmp_path, "a.py", 'dist.init_process_group(backend="nccl")\n')
