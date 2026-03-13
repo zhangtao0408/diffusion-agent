@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from diffusion_agent.scenarios.adapt import AdaptReport, AdaptScenario
+from diffusion_agent.scenarios.adapt import AdaptReport, AdaptScenario, _render_npu_readme
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +126,55 @@ class TestAdaptReport:
         assert d["model_name"] == "test"
         assert d["llm_fixes_applied"] == 0
         assert isinstance(d["recommendations"], list)
+
+
+# ---------------------------------------------------------------------------
+# Report JSON validity
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# NPU Adaptation README
+# ---------------------------------------------------------------------------
+
+class TestNpuReadme:
+    def test_readme_generated(self, tmp_path: Path) -> None:
+        code = "import torch\nx = tensor.cuda()\n"
+        _write(tmp_path, "model.py", code)
+        state = _make_state(tmp_path)
+        AdaptScenario().execute(state)
+        assert (tmp_path / "NPU_ADAPTATION_README.md").exists()
+
+    def test_readme_contains_changed_files(self, tmp_path: Path) -> None:
+        _write(tmp_path, "model.py", "import torch\nx = tensor.cuda()\n")
+        state = _make_state(tmp_path)
+        AdaptScenario().execute(state)
+        readme = (tmp_path / "NPU_ADAPTATION_README.md").read_text()
+        assert "model.py" in readme
+
+    def test_readme_contains_run_instructions(self, tmp_path: Path) -> None:
+        _write(tmp_path, "model.py", "import torch\nx = tensor.cuda()\n")
+        state = _make_state(tmp_path)
+        AdaptScenario().execute(state)
+        readme = (tmp_path / "NPU_ADAPTATION_README.md").read_text()
+        assert "## How to Run" in readme
+
+    def test_render_npu_readme_empty_report(self) -> None:
+        report = AdaptReport(
+            model_name="empty",
+            repo_local_path="/tmp/empty",
+            verdict="success",
+            total_files_modified=0,
+            total_migrations_applied=0,
+            migration_results=[],
+            llm_fixes_applied=0,
+            llm_fixes_skipped=0,
+            skipped_patterns=[],
+            recommendations=[],
+        )
+        result = _render_npu_readme(report)
+        assert "## What Changed" in result
+        assert "## How to Run" in result
+        assert "## Next Steps" in result
 
 
 # ---------------------------------------------------------------------------
