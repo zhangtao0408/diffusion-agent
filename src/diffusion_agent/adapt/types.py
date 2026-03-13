@@ -168,6 +168,7 @@ class ExecutionConfig:
     ])
     sync_timeout: int = 60
     sync_delete: bool = False  # whether to --delete files on remote
+    sync_prefer_scp: bool = False  # use scp instead of rsync (when rsync unavailable)
 
     def to_dict(self) -> dict[str, Any]:
         return {

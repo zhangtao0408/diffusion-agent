@@ -100,6 +100,7 @@ class AdaptSupervisor:
                 exclude_patterns=execution_config.sync_exclude,
                 sync_timeout=execution_config.sync_timeout,
                 delete=execution_config.sync_delete,
+                prefer_scp=execution_config.sync_prefer_scp,
             )
         else:
             self.sync = NoOpSync()
@@ -248,6 +249,9 @@ class AdaptSupervisor:
                 self.state.stop_reason = StopReason.MAX_ITERATIONS
                 break
 
+            # Reset per-task no-progress counter so one hard task
+            # doesn't poison the remaining tasks.
+            self.state.consecutive_no_progress = 0
             self._process_task(task, findings)
 
     def _process_task(self, task: AdaptationTask, findings: list[Finding]) -> None:

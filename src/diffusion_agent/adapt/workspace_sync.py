@@ -309,6 +309,119 @@ class RsyncSync:
 
 
 # ---------------------------------------------------------------------------
+# SCP-based sync (fallback when rsync is unavailable)
+# ---------------------------------------------------------------------------
+
+class ScpSync:
+    """Syncs files to remote via scp — fallback when rsync is not available.
+
+    Less efficient than rsync (no delta transfer) but universally available.
+    Syncs only the specific changed files, one scp invocation per batch.
+    """
+
+    def __init__(self, config: RsyncConfig) -> None:
+        self.config = config
+
+    def sync(
+        self,
+        changed_files: list[str],
+        local_root: Path,
+    ) -> SyncResult:
+        if not self.config.remote_workdir:
+            return SyncResult(
+                success=False, mode="scp",
+                error="No remote_workdir configured",
+            )
+
+        relative_files = _to_relative_paths(changed_files, local_root)
+        existing = [f for f in relative_files if (local_root / f).exists()]
+
+        if not existing:
+            return SyncResult(
+                success=True, mode="scp",
+                files_synced=[], files_requested=0,
+                local_root=str(local_root),
+            )
+
+        log.info("sync_scp", files=len(existing),
+                 remote=f"{self.config.user}@{self.config.host}:{self.config.remote_workdir}")
+
+        start = time.monotonic()
+        errors: list[str] = []
+        synced: list[str] = []
+
+        # Ensure remote directories exist first
+        remote_dirs = {str(Path(f).parent) for f in existing if "/" in f}
+        if remote_dirs:
+            mkdir_cmd = " && ".join(
+                f"mkdir -p {shlex.quote(self.config.remote_workdir + '/' + d)}"
+                for d in sorted(remote_dirs)
+            )
+            self._run_ssh_cmd(mkdir_cmd)
+
+        # Copy files in batches via scp
+        for f in existing:
+            local_path = str(local_root / f)
+            remote_path = (
+                f"{self.config.user}@{self.config.host}:"
+                f"{self.config.remote_workdir}/{f}"
+            )
+            try:
+                args = self._build_scp_args(local_path, remote_path)
+                result = subprocess.run(
+                    args, capture_output=True, text=True,
+                    timeout=self.config.timeout, check=False,
+                )
+                if result.returncode == 0:
+                    synced.append(f)
+                else:
+                    errors.append(f"scp {f}: {result.stderr.strip()[:100]}")
+            except subprocess.TimeoutExpired:
+                errors.append(f"scp {f}: timed out")
+            except OSError as exc:
+                errors.append(f"scp {f}: {exc}")
+
+        elapsed = time.monotonic() - start
+
+        if errors:
+            return SyncResult(
+                success=False, mode="scp",
+                files_synced=synced, files_requested=len(changed_files),
+                local_root=str(local_root),
+                remote_target=f"{self.config.user}@{self.config.host}:{self.config.remote_workdir}",
+                duration_s=round(elapsed, 2),
+                error="; ".join(errors[:5]),
+            )
+
+        return SyncResult(
+            success=True, mode="scp",
+            files_synced=synced, files_requested=len(changed_files),
+            local_root=str(local_root),
+            remote_target=f"{self.config.user}@{self.config.host}:{self.config.remote_workdir}",
+            duration_s=round(elapsed, 2),
+        )
+
+    def _build_scp_args(self, local_path: str, remote_path: str) -> list[str]:
+        args = ["scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
+        if self.config.port != 22:
+            args.extend(["-P", str(self.config.port)])
+        args.extend([local_path, remote_path])
+        return args
+
+    def _run_ssh_cmd(self, cmd: str) -> None:
+        """Run a command on the remote host via ssh (for mkdir etc.)."""
+        args = ["ssh", "-o", "BatchMode=yes"]
+        if self.config.port != 22:
+            args.extend(["-p", str(self.config.port)])
+        args.append(f"{self.config.user}@{self.config.host}")
+        args.extend(["bash", "-c", cmd])
+        try:
+            subprocess.run(args, capture_output=True, timeout=30, check=False)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -322,8 +435,13 @@ def create_workspace_sync(
     sync_timeout: int = 60,
     delete: bool = False,
     ssh_options: list[str] | None = None,
+    prefer_scp: bool = False,
 ) -> WorkspaceSync:
-    """Create the appropriate sync backend from parameters."""
+    """Create the appropriate sync backend from parameters.
+
+    When ``prefer_scp`` is True, uses ScpSync instead of RsyncSync
+    (useful when the remote host doesn't have rsync installed).
+    """
     if mode == "ssh" and ssh_host and remote_workdir:
         cfg = RsyncConfig(
             host=ssh_host,
@@ -337,6 +455,9 @@ def create_workspace_sync(
             cfg.exclude_patterns = exclude_patterns
         if ssh_options is not None:
             cfg.ssh_options = ssh_options
+
+        if prefer_scp:
+            return ScpSync(cfg)
         return RsyncSync(cfg)
 
     return NoOpSync()

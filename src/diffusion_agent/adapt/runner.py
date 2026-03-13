@@ -169,7 +169,11 @@ class AdaptRunner:
         return self.run_command(f'python -c "{script}"')
 
     def run_syntax_check(self, file_paths: list[str] | None = None) -> RunResult:
-        """Check Python files for syntax errors."""
+        """Check Python files for syntax errors.
+
+        When running via SSH, local absolute paths are converted to paths
+        relative to the repo root so they resolve inside ``remote_workdir``.
+        """
         if file_paths:
             targets = file_paths
         else:
@@ -184,9 +188,16 @@ class AdaptRunner:
                 error_signature="", duration_s=0.0, command="syntax_check",
             )
 
-        # Limit batch size and join as shell command
-        batch = targets[:50]
-        cmd = "python -m py_compile " + " ".join(batch)
+        # Convert local paths to repo-relative for remote execution
+        repo_str = str(self.repo_path)
+        relative_targets: list[str] = []
+        for t in targets[:50]:
+            if t.startswith(repo_str):
+                relative_targets.append(t[len(repo_str):].lstrip("/"))
+            else:
+                relative_targets.append(t)
+
+        cmd = "python -m py_compile " + " ".join(relative_targets)
         return self.run_command(cmd)
 
     def run_command_string(self, cmd_string: str) -> RunResult:

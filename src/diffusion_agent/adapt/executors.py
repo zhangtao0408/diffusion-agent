@@ -150,23 +150,37 @@ class SSHExecutor:
         self.config = config
 
     def _build_remote_command(self, command: str) -> str:
-        """Compose the full remote shell command with env/workdir setup."""
-        parts: list[str] = []
+        """Compose the full remote shell command with env/workdir setup.
 
-        # Change to remote workdir
-        if self.config.remote_workdir:
-            parts.append(f"cd {shlex.quote(self.config.remote_workdir)}")
+        Uses ``conda run -n <env> --no-capture-output`` instead of
+        ``conda activate`` because activate requires conda init in the
+        shell profile, which is unreliable in non-interactive ``bash -lc``.
+
+        The workdir ``cd`` is placed inside the conda run invocation
+        (via ``bash -c 'cd ... && ...'``) because conda run starts a
+        fresh subshell that doesn't inherit the outer cwd.
+        """
+        parts: list[str] = []
 
         # Run any pre-commands (e.g. source scripts)
         for pre in self.config.pre_commands:
             parts.append(pre)
 
-        # Activate conda environment
-        if self.config.conda_env:
-            parts.append(f"conda activate {shlex.quote(self.config.conda_env)}")
+        # Build the inner command (cd + actual command)
+        inner_parts: list[str] = []
+        if self.config.remote_workdir:
+            inner_parts.append(f"cd {shlex.quote(self.config.remote_workdir)}")
+        inner_parts.append(command)
+        inner_cmd = " && ".join(inner_parts)
 
-        # The actual command
-        parts.append(command)
+        # Wrap with conda run if needed
+        if self.config.conda_env:
+            env = shlex.quote(self.config.conda_env)
+            # Use bash -c to preserve the cd + command chain inside conda run
+            escaped_inner = inner_cmd.replace("'", "'\\''")
+            parts.append(f"conda run -n {env} --no-capture-output bash -c '{escaped_inner}'")
+        else:
+            parts.append(inner_cmd)
 
         return " && ".join(parts)
 

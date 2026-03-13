@@ -91,8 +91,9 @@ class TestSSHExecutorBuild:
         cfg = SSHConfig(host="h", conda_env="torch280_py310_diffusion")
         ex = SSHExecutor(cfg)
         remote = ex._build_remote_command("python -c 'import torch'")
-        assert "conda activate" in remote
+        assert "conda run -n" in remote
         assert "torch280_py310_diffusion" in remote
+        assert "import torch" in remote
 
     def test_pre_commands(self) -> None:
         cfg = SSHConfig(host="h", pre_commands=["source /opt/env.sh"])
@@ -110,8 +111,11 @@ class TestSSHExecutorBuild:
         )
         ex = SSHExecutor(cfg)
         remote = ex._build_remote_command("python infer.py")
-        parts = remote.split(" && ")
-        assert len(parts) == 4  # cd, export, conda activate, python infer.py
+        # pre_commands && conda run -n ... bash -c 'cd ... && python infer.py'
+        assert "export ASCEND_HOME" in remote
+        assert "conda run -n torch280" in remote
+        assert "cd /data/models/LTX-2" in remote
+        assert "python infer.py" in remote
 
     def test_ssh_args_default_port(self) -> None:
         cfg = SSHConfig(host="server.com")
