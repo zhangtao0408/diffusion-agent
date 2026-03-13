@@ -43,6 +43,9 @@ class AgentState(TypedDict, total=False):
     completed_features: list[str]
     tool_results: list[dict[str, Any]]
 
+    # NPU
+    torch_npu_version: str | None
+
     # Control
     git_branch: str
     error: str | None

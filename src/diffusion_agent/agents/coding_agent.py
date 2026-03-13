@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from diffusion_agent.agents.state import AgentState
+from diffusion_agent.scenarios.check_support import CheckSupportScenario
 from diffusion_agent.state_mgmt.daily_log import append_log
 from diffusion_agent.state_mgmt.feature_list import (
     get_next_pending,
@@ -46,12 +47,18 @@ def coding_node(state: AgentState) -> dict:
         "attempt": 1,
     })
 
-    # --- STUB: Scenario execution goes here ---
-    # In future phases, this will dispatch to the appropriate scenario module:
-    #   scenario_impl = get_scenario(state["scenario"])
-    #   state = scenario_impl.execute(state)
-    log.info("executing_feature_stub", feature=feature.name)
-    append_log(repo_local, f"Executed feature: {feature.name} (stub)")
+    # Dispatch to scenario implementation
+    tool_results = list(state.get("tool_results", []))
+    scenario_name = state.get("scenario", "")
+    if scenario_name == "check":
+        log.info("executing_check_scenario", feature=feature.name)
+        scenario_impl = CheckSupportScenario()
+        updated_state = scenario_impl.execute(state)
+        tool_results = list(updated_state.get("tool_results", []))
+        append_log(repo_local, f"Executed feature: {feature.name} (check_support)")
+    else:
+        log.info("executing_feature_stub", feature=feature.name)
+        append_log(repo_local, f"Executed feature: {feature.name} (stub)")
 
     # Mark feature as completed
     update_feature_status(repo_local, feature.id, "completed")
@@ -67,6 +74,7 @@ def coding_node(state: AgentState) -> dict:
 
     return {
         "completed_features": completed,
+        "tool_results": tool_results,
         "current_task": None,
         "error": None,
     }
