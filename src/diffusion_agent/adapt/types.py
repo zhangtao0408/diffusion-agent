@@ -197,20 +197,113 @@ class StopReason(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# Task attempt — one hypothesis cycle within a task
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TaskAttempt:
+    """Record of a single hypothesis attempt within a task."""
+
+    attempt: int
+    hypothesis: Hypothesis
+    verdict: Verdict
+    accepted: bool
+    error_signature: str = ""
+    files_changed: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt": self.attempt,
+            "hypothesis": self.hypothesis.to_dict(),
+            "verdict": self.verdict.value,
+            "accepted": self.accepted,
+            "error_signature": self.error_signature,
+            "files_changed": self.files_changed,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Task stop reason — why a task ended
+# ---------------------------------------------------------------------------
+
+class TaskStopReason(str, Enum):
+    """Why an individual task stopped."""
+
+    FIXED = "fixed"
+    BLOCKED = "blocked"
+    EXHAUSTED = "exhausted"             # max attempts reached
+    NO_HYPOTHESIS = "no_hypothesis"     # planner has nothing left to try
+    REPEATED_ERROR = "repeated_error"   # same error seen across attempts
+
+
+# ---------------------------------------------------------------------------
 # Adaptation task — one unit in the feature decomposition
 # ---------------------------------------------------------------------------
 
 @dataclass
 class AdaptationTask:
-    """A granular migration task produced by feature decomposition."""
+    """A granular migration task produced by feature decomposition.
+
+    Status lifecycle: pending → in_progress → completed | blocked | exhausted
+    """
 
     id: str
     name: str
     description: str
     category: FailureCategory
     target_files: list[str] = field(default_factory=list)
-    status: str = "pending"  # pending / in_progress / completed / blocked
+    status: str = "pending"  # pending / in_progress / completed / blocked / exhausted
     blocker_reason: str | None = None
+
+    # Attempt tracking
+    max_attempts: int = 3
+    attempts: list[TaskAttempt] = field(default_factory=list)
+    last_error_signature: str = ""
+    stop_reason: TaskStopReason | None = None
+
+    @property
+    def attempt_count(self) -> int:
+        return len(self.attempts)
+
+    @property
+    def accepted_attempts(self) -> list[TaskAttempt]:
+        return [a for a in self.attempts if a.accepted]
+
+    @property
+    def rejected_attempts(self) -> list[TaskAttempt]:
+        return [a for a in self.attempts if not a.accepted]
+
+    @property
+    def seen_error_signatures(self) -> set[str]:
+        """All distinct error signatures observed across attempts."""
+        return {a.error_signature for a in self.attempts if a.error_signature}
+
+    @property
+    def seen_hypothesis_ids(self) -> set[str]:
+        """All hypothesis IDs previously tried for this task."""
+        return {a.hypothesis.id for a in self.attempts}
+
+    def record_attempt(
+        self,
+        hypothesis: Hypothesis,
+        verdict: Verdict,
+        accepted: bool,
+        error_signature: str = "",
+        files_changed: list[str] | None = None,
+    ) -> TaskAttempt:
+        """Record an attempt and return the TaskAttempt."""
+        attempt = TaskAttempt(
+            attempt=self.attempt_count + 1,
+            hypothesis=hypothesis,
+            verdict=verdict,
+            accepted=accepted,
+            error_signature=error_signature,
+            files_changed=files_changed or [],
+        )
+        self.attempts.append(attempt)
+        if error_signature:
+            self.last_error_signature = error_signature
+        return attempt
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -221,6 +314,11 @@ class AdaptationTask:
             "target_files": self.target_files,
             "status": self.status,
             "blocker_reason": self.blocker_reason,
+            "max_attempts": self.max_attempts,
+            "attempt_count": self.attempt_count,
+            "attempts": [a.to_dict() for a in self.attempts],
+            "last_error_signature": self.last_error_signature,
+            "stop_reason": self.stop_reason.value if self.stop_reason else None,
         }
 
 

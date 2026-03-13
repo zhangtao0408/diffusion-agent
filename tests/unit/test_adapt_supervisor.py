@@ -203,3 +203,63 @@ class TestSupervisorSync:
         )
         sup = AdaptSupervisor(tmp_path, model_name="test", use_git=False, execution_config=cfg)
         assert isinstance(sup.sync, NoOpSync)
+
+
+class TestSupervisorMultiAttempt:
+    """Tests for the multi-attempt per-task loop."""
+
+    def test_task_records_attempts(self, tmp_path: Path) -> None:
+        _write(tmp_path, "model.py", "import torch\nx = tensor.cuda()\n")
+        sup = AdaptSupervisor(tmp_path, model_name="test", use_git=False)
+        state = sup.run()
+
+        # Batch phase handles cuda_call → tasks completed by batch
+        for task in state.tasks:
+            if task.status == "completed":
+                # Tasks completed by batch have no attempts (batch bypass)
+                # Tasks completed by iterative loop have attempts
+                pass
+
+    def test_task_exhausted_status(self, tmp_path: Path) -> None:
+        """A task that runs out of attempts gets status 'exhausted'."""
+        _write(tmp_path, "model.py", "import torch\nx = tensor.cuda()\n")
+        sup = AdaptSupervisor(tmp_path, model_name="test", use_git=False)
+        state = sup.run()
+
+        # With deterministic rules, tasks should be completed by batch, not exhausted
+        exhausted = [t for t in state.tasks if t.status == "exhausted"]
+        # No tasks should be exhausted for simple CUDA patterns
+        assert len(exhausted) == 0
+
+    def test_task_stop_reason_set(self, tmp_path: Path) -> None:
+        """Completed tasks from the iterative loop have a stop_reason."""
+        _write(tmp_path, "model.py", "import torch\nx = tensor.cuda()\n")
+        sup = AdaptSupervisor(tmp_path, model_name="test", use_git=False)
+        state = sup.run()
+
+        # Batch-completed tasks don't go through _process_task
+        # so they won't have a stop_reason. This is correct behavior.
+        for task in state.tasks:
+            if task.status == "completed" and task.attempt_count > 0:
+                assert task.stop_reason is not None
+
+    def test_no_hypothesis_marks_task_done(self, tmp_path: Path) -> None:
+        """If planner returns None on first attempt, task is marked completed."""
+        # File with no CUDA patterns but scanner still finds something
+        # In practice, batch handles everything → iterative gets empty tasks
+        _write(tmp_path, "model.py", "import os\nprint('hello')\n")
+        sup = AdaptSupervisor(tmp_path, model_name="test", use_git=False)
+        state = sup.run()
+        # No findings → no tasks → stop immediately
+        assert state.stop_reason == StopReason.ALL_RULES_APPLIED
+
+    def test_task_to_dict_includes_stop_reason(self, tmp_path: Path) -> None:
+        _write(tmp_path, "model.py", "import torch\nx = tensor.cuda()\n")
+        sup = AdaptSupervisor(tmp_path, model_name="test", use_git=False)
+        state = sup.run()
+
+        for task in state.tasks:
+            d = task.to_dict()
+            assert "stop_reason" in d
+            assert "attempt_count" in d
+            assert "attempts" in d

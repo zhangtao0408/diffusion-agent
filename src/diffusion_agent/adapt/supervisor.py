@@ -29,6 +29,7 @@ from diffusion_agent.adapt.types import (
     Hypothesis,
     IterationRecord,
     StopReason,
+    TaskStopReason,
     Verdict,
 )
 from diffusion_agent.adapt.workspace_sync import (
@@ -226,8 +227,12 @@ class AdaptSupervisor:
     # ----- Phase B: Iterative loop -----
 
     def _iterative_loop(self, original_findings: list[Finding]) -> None:
-        """Run the iterative adapt-run-judge loop for remaining tasks."""
-        # Find pending tasks after batch phase
+        """Run the iterative adapt-run-judge loop for remaining tasks.
+
+        Each task gets up to ``task.max_attempts`` hypothesis cycles.
+        The outer loop iterates over tasks; the inner loop iterates
+        attempts within a single task.
+        """
         pending = [t for t in self.state.tasks if t.status == "pending"]
         if not pending:
             return
@@ -246,107 +251,162 @@ class AdaptSupervisor:
             self._process_task(task, findings)
 
     def _process_task(self, task: AdaptationTask, findings: list[Finding]) -> None:
-        """Process a single adaptation task through the hypothesis cycle."""
+        """Process a single adaptation task through multiple hypothesis attempts.
+
+        Runs up to ``task.max_attempts`` iterations.  Each attempt follows:
+        hypothesis → snapshot → baseline → patch → sync → validate → judge →
+        accept/rollback → record.  The task transitions to a terminal status
+        (completed / blocked / exhausted) when a stop condition fires.
+        """
         task.status = "in_progress"
-        self.state.iteration += 1
+        log.info("supervisor_task_start", task=task.name, max_attempts=task.max_attempts)
 
-        log.info("supervisor_task_start", task=task.name, iteration=self.state.iteration)
+        while task.attempt_count < task.max_attempts:
+            # Global stop conditions
+            if self.state.stop_reason is not None:
+                break
+            if self.state.iteration >= self.state.max_iterations:
+                self.state.stop_reason = StopReason.MAX_ITERATIONS
+                break
 
-        # 1. Generate hypothesis (planner)
-        plan = self.registry.match_all(findings)
-        hypothesis = self.planner.generate_hypothesis(task, findings, plan)
+            self.state.iteration += 1
 
-        if hypothesis is None:
-            task.status = "completed"
-            log.info("supervisor_task_skip", task=task.name, reason="no hypothesis")
-            return
+            # 1. Generate hypothesis (planner checks task.seen_hypothesis_ids)
+            plan = self.registry.match_all(findings)
+            hypothesis = self.planner.generate_hypothesis(task, findings, plan)
 
-        # 2. Snapshot git state
-        snapshot = self.git.snapshot() if self.git else ""
-
-        # 3. Run validation BEFORE patch (baseline)
-        run_before = self.runner.run_syntax_check(
-            [f for f in task.target_files if Path(f).exists()]
-        )
-
-        # 4. Apply patch (patch worker)
-        patch_result = self.worker.apply_patch(hypothesis, findings)
-
-        # 4b. Sync patched files to remote before validation
-        if patch_result.files_changed:
-            self._sync_to_remote(patch_result.files_changed)
-
-        # 5. Run validation AFTER patch
-        run_after = self.runner.run_syntax_check(
-            [f for f in task.target_files if Path(f).exists()]
-        )
-
-        # 6. Judge progress
-        verdict = self.judge.judge(run_before, run_after)
-
-        # 7. Accept or rollback
-        accepted = self.judge.should_accept(verdict) or (
-            verdict == Verdict.UNCHANGED and patch_result.files_changed
-        )
-
-        commit_sha = None
-        if accepted:
-            self.state.files_modified.update(patch_result.files_changed)
-            self.state.total_rules_applied += len(patch_result.rules_applied)
-            task.status = "completed"
-
-            if self.git and self.git.has_changes():
-                commit_sha = self.git.commit_iteration(
-                    self.state.iteration, hypothesis, verdict,
+            if hypothesis is None:
+                task.status = "exhausted" if task.attempt_count > 0 else "completed"
+                task.stop_reason = (
+                    TaskStopReason.NO_HYPOTHESIS
+                    if task.attempt_count > 0
+                    else TaskStopReason.FIXED
                 )
-        else:
-            # Rollback
-            if self.git and snapshot:
-                self.git.rollback_to(snapshot)
-            # Re-sync rolled-back state so remote workspace is consistent
+                log.info(
+                    "supervisor_task_no_hypothesis",
+                    task=task.name,
+                    attempts=task.attempt_count,
+                )
+                return
+
+            # 2. Snapshot git state
+            snapshot = self.git.snapshot() if self.git else ""
+
+            # 3. Baseline validation
+            run_before = self.runner.run_syntax_check(
+                [f for f in task.target_files if Path(f).exists()]
+            )
+
+            # 4. Apply patch
+            patch_result = self.worker.apply_patch(hypothesis, findings)
+
+            # 4b. Sync patched files to remote
             if patch_result.files_changed:
                 self._sync_to_remote(patch_result.files_changed)
-            task.status = "pending"  # can retry with different hypothesis
 
-        # 8. Record iteration
-        record = IterationRecord(
-            iteration=self.state.iteration,
-            hypothesis=hypothesis,
-            patch_description=patch_result.description,
-            files_changed=patch_result.files_changed,
-            run_before=run_before,
-            run_after=run_after,
-            verdict=verdict,
-            accepted=accepted,
-            commit_sha=commit_sha,
-        )
-        self.state.iterations.append(record)
+            # 5. Post-patch validation
+            run_after = self.runner.run_syntax_check(
+                [f for f in task.target_files if Path(f).exists()]
+            )
 
-        # 9. Update no-progress counter
-        if verdict in {Verdict.UNCHANGED, Verdict.REGRESSED, Verdict.DIFFERENT_FAILURE}:
-            self.state.consecutive_no_progress += 1
-        else:
-            self.state.consecutive_no_progress = 0
+            # 6. Judge progress
+            verdict = self.judge.judge(run_before, run_after)
 
-        # 10. Check stop conditions
-        if self.judge.should_stop(verdict):
+            # 7. Accept or rollback
+            accepted = self.judge.should_accept(verdict) or (
+                verdict == Verdict.UNCHANGED and patch_result.files_changed
+            )
+
+            commit_sha = None
+            if accepted:
+                self.state.files_modified.update(patch_result.files_changed)
+                self.state.total_rules_applied += len(patch_result.rules_applied)
+                if self.git and self.git.has_changes():
+                    commit_sha = self.git.commit_iteration(
+                        self.state.iteration, hypothesis, verdict,
+                    )
+            else:
+                if self.git and snapshot:
+                    self.git.rollback_to(snapshot)
+                if patch_result.files_changed:
+                    self._sync_to_remote(patch_result.files_changed)
+
+            # 8. Record attempt on the task
+            task.record_attempt(
+                hypothesis=hypothesis,
+                verdict=verdict,
+                accepted=accepted,
+                error_signature=run_after.error_signature,
+                files_changed=patch_result.files_changed,
+            )
+
+            # 9. Record iteration on the session
+            record = IterationRecord(
+                iteration=self.state.iteration,
+                hypothesis=hypothesis,
+                patch_description=patch_result.description,
+                files_changed=patch_result.files_changed,
+                run_before=run_before,
+                run_after=run_after,
+                verdict=verdict,
+                accepted=accepted,
+                commit_sha=commit_sha,
+            )
+            self.state.iterations.append(record)
+
+            # 10. Update global no-progress counter
+            if verdict in {Verdict.UNCHANGED, Verdict.REGRESSED, Verdict.DIFFERENT_FAILURE}:
+                self.state.consecutive_no_progress += 1
+            else:
+                self.state.consecutive_no_progress = 0
+
+            if self.state.consecutive_no_progress >= self.state.no_progress_limit:
+                self.state.stop_reason = StopReason.REPEATED_NO_PROGRESS
+
+            log.info(
+                "supervisor_attempt_done",
+                iteration=self.state.iteration,
+                task=task.name,
+                attempt=task.attempt_count,
+                verdict=verdict.value,
+                accepted=accepted,
+            )
+
+            # 11. Per-task stop decisions
             if verdict == Verdict.BLOCKED:
+                task.status = "blocked"
+                task.stop_reason = TaskStopReason.BLOCKED
+                task.blocker_reason = run_after.error_signature
                 self.state.blockers.append(
                     f"{task.name}: {hypothesis.description}"
                 )
-                task.status = "blocked"
-                task.blocker_reason = run_after.error_signature
+                return
 
-        if self.state.consecutive_no_progress >= self.state.no_progress_limit:
-            self.state.stop_reason = StopReason.REPEATED_NO_PROGRESS
+            if accepted and verdict in {Verdict.FIXED, Verdict.IMPROVED}:
+                task.status = "completed"
+                task.stop_reason = TaskStopReason.FIXED
+                return
 
-        log.info(
-            "supervisor_iteration_done",
-            iteration=self.state.iteration,
-            task=task.name,
-            verdict=verdict.value,
-            accepted=accepted,
-        )
+            # Repeated error across attempts → stop early
+            if (
+                run_after.error_signature
+                and run_after.error_signature == task.last_error_signature
+                and task.attempt_count >= 2
+            ):
+                task.status = "exhausted"
+                task.stop_reason = TaskStopReason.REPEATED_ERROR
+                log.info(
+                    "supervisor_task_repeated_error",
+                    task=task.name,
+                    sig=run_after.error_signature[:80],
+                )
+                return
+
+        # If we exit the while loop without returning, attempts exhausted
+        if task.status == "in_progress":
+            task.status = "exhausted"
+            task.stop_reason = TaskStopReason.EXHAUSTED
+            log.info("supervisor_task_exhausted", task=task.name, attempts=task.attempt_count)
 
     # ----- Blocker report -----
 

@@ -112,6 +112,78 @@ class TestGenerateHypothesis:
         assert h is None
 
 
+class TestHypothesisDedup:
+    """Tests that the planner skips already-tried hypotheses."""
+
+    def setup_method(self) -> None:
+        self.registry = create_default_registry()
+        self.planner = AdaptPlanner(self.registry)
+
+    def test_skips_already_tried_rule_hypothesis(self) -> None:
+        findings = [_finding("model.py", PatternType.CUDA_CALL)]
+        plan = self.registry.match_all(findings)
+        task = AdaptationTask(
+            id="t-1", name="test", description="test",
+            category=FailureCategory.DEVICE_SELECTION,
+            target_files=["model.py"],
+        )
+        # First call: should return rule hypothesis
+        h1 = self.planner.generate_hypothesis(task, findings, plan)
+        assert h1 is not None
+        assert h1.source == "rule"
+
+        # Record attempt with that hypothesis
+        task.record_attempt(h1, Verdict.UNCHANGED, False, "err-1")
+
+        # Second call: rule hyp already seen → falls through to LLM
+        h2 = self.planner.generate_hypothesis(task, findings, plan)
+        assert h2 is not None
+        assert h2.source == "llm"
+        assert h2.id != h1.id
+
+    def test_returns_none_on_repeated_error(self) -> None:
+        findings = [_finding("model.py", PatternType.DISTRIBUTED)]
+        plan = self.registry.match_all(findings)
+        task = AdaptationTask(
+            id="t-1", name="test", description="test",
+            category=FailureCategory.DISTRIBUTED_BACKEND,
+            target_files=["model.py"],
+        )
+        # Record two attempts with the same error signature
+        h_dummy = Hypothesis(
+            id="hyp-t-1-llm-1", category=FailureCategory.DISTRIBUTED_BACKEND,
+            description="test", target_files=["model.py"],
+            proposed_action="fix", source="llm",
+        )
+        task.record_attempt(h_dummy, Verdict.UNCHANGED, False, "same-err")
+        h_dummy2 = Hypothesis(
+            id="hyp-t-1-llm-2", category=FailureCategory.DISTRIBUTED_BACKEND,
+            description="test2", target_files=["model.py"],
+            proposed_action="fix2", source="llm",
+        )
+        task.record_attempt(h_dummy2, Verdict.UNCHANGED, False, "same-err")
+
+        # Now planner should return None (repeated error seen >= 2 times)
+        h = self.planner.generate_hypothesis(task, findings, plan)
+        assert h is None
+
+    def test_llm_hypothesis_ids_are_unique(self) -> None:
+        findings = [_finding("model.py", PatternType.DISTRIBUTED)]
+        plan = self.registry.match_all(findings)
+        task = AdaptationTask(
+            id="t-1", name="test", description="test",
+            category=FailureCategory.DISTRIBUTED_BACKEND,
+            target_files=["model.py"],
+        )
+        h1 = self.planner.generate_hypothesis(task, findings, plan)
+        assert h1 is not None
+        task.record_attempt(h1, Verdict.UNCHANGED, False, "err-1")
+
+        h2 = self.planner.generate_hypothesis(task, findings, plan)
+        assert h2 is not None
+        assert h2.id != h1.id
+
+
 class TestCountNoProgress:
     def setup_method(self) -> None:
         self.planner = AdaptPlanner(create_default_registry())

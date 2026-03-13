@@ -226,9 +226,10 @@ def _determine_verdict(state: AdaptationState) -> str:
         return "partial"
     blocked_tasks = [t for t in state.tasks if t.status == "blocked"]
     pending_tasks = [t for t in state.tasks if t.status == "pending"]
+    exhausted_tasks = [t for t in state.tasks if t.status == "exhausted"]
     if blocked_tasks:
         return "partial"
-    if pending_tasks:
+    if pending_tasks or exhausted_tasks:
         return "partial"
     return "success"
 
@@ -237,8 +238,11 @@ def _build_recommendations(state: AdaptationState) -> list[str]:
     recs: list[str] = []
     blocked = [t for t in state.tasks if t.status == "blocked"]
     pending = [t for t in state.tasks if t.status == "pending"]
+    exhausted = [t for t in state.tasks if t.status == "exhausted"]
     if blocked:
         recs.append(f"{len(blocked)} task(s) blocked — may require manual intervention or unsupported-op workaround.")
+    if exhausted:
+        recs.append(f"{len(exhausted)} task(s) exhausted all attempts — consider increasing max_attempts or trying a different approach.")
     if pending:
         recs.append(f"{len(pending)} task(s) still pending — consider re-running with LLM enabled.")
     recs.append("Run `--scenario check` after adaptation to verify remaining issues.")
@@ -353,7 +357,7 @@ class AdaptScenario(ScenarioBase):
         skipped_patterns = [
             f"{t.category.value}: {t.description}"
             for t in adapt_state.tasks
-            if t.status in ("pending", "blocked")
+            if t.status in ("pending", "blocked", "exhausted")
         ]
         llm_fixes_applied = sum(
             1 for it in adapt_state.iterations

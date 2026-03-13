@@ -122,7 +122,13 @@ class AdaptPlanner:
         Uses the rule registry to find matching rules. If rules exist,
         proposes a deterministic rule-based fix. Otherwise, proposes
         an LLM-assisted fix.
+
+        Deduplicates against the task's attempt history so the same
+        hypothesis ID is never proposed twice for the same task.
         """
+        seen_ids = task.seen_hypothesis_ids
+        seen_errors = task.seen_error_signatures
+
         # Filter findings for this task's files
         task_findings = [f for f in findings if f.file_path in task.target_files]
         if not task_findings:
@@ -136,19 +142,39 @@ class AdaptPlanner:
                 matched_rules.append(rule.name)
 
         if matched_rules:
-            return Hypothesis(
-                id=f"hyp-{task.id}-rules",
-                category=task.category,
-                description=f"Apply migration rules to {Path(task.target_files[0]).name}",
-                target_files=task.target_files,
-                proposed_action=f"Apply rules: {', '.join(set(matched_rules))}",
-                source="rule",
-            )
+            hyp_id = f"hyp-{task.id}-rules"
+            if hyp_id not in seen_ids:
+                return Hypothesis(
+                    id=hyp_id,
+                    category=task.category,
+                    description=f"Apply migration rules to {Path(task.target_files[0]).name}",
+                    target_files=task.target_files,
+                    proposed_action=f"Apply rules: {', '.join(set(matched_rules))}",
+                    source="rule",
+                )
+            log.info("planner_skip_seen_hypothesis", hyp_id=hyp_id, task=task.id)
 
-        # No deterministic rules — propose LLM-assisted fix
+        # No deterministic rules (or already tried) — propose LLM-assisted fix
         pattern_desc = ", ".join({f.pattern_type.value for f in task_findings})
+        attempt_num = task.attempt_count + 1
+        hyp_id = f"hyp-{task.id}-llm-{attempt_num}"
+
+        # If the last error signature was already seen, signal repeated failure
+        if task.last_error_signature and task.last_error_signature in seen_errors:
+            repeated_count = sum(
+                1 for a in task.attempts if a.error_signature == task.last_error_signature
+            )
+            if repeated_count >= 2:
+                log.info(
+                    "planner_repeated_error",
+                    task=task.id,
+                    sig=task.last_error_signature[:80],
+                    seen=repeated_count,
+                )
+                return None  # signal: no new hypothesis available
+
         return Hypothesis(
-            id=f"hyp-{task.id}-llm",
+            id=hyp_id,
             category=task.category,
             description=f"LLM-assisted fix for {pattern_desc} in {Path(task.target_files[0]).name}",
             target_files=task.target_files,
