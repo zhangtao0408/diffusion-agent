@@ -142,8 +142,11 @@ class TestSSHExecutorBuild:
         cfg = SSHConfig(host="h")
         ex = SSHExecutor(cfg)
         args = ex._build_ssh_args("echo test")
-        assert "bash" in args
-        assert "-lc" in args
+        # bash -lc and the command must be in a SINGLE argument
+        # so SSH passes it intact (not split across multiple args)
+        bash_arg = [a for a in args if a.startswith("bash -lc")]
+        assert len(bash_arg) == 1, f"Expected single 'bash -lc ...' arg, got: {args}"
+        assert "echo test" in bash_arg[0]
 
 
 # ---------------------------------------------------------------------------

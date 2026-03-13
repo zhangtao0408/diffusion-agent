@@ -206,9 +206,12 @@ class SSHExecutor:
         # Target
         args.append(f"{self.config.user}@{self.config.host}")
 
-        # Remote command — pass as a single string via bash -lc
-        # Using bash -lc ensures login profile is sourced (needed for conda init)
-        args.extend(["bash", "-lc", remote_command])
+        # Remote command — must be a SINGLE argument so SSH passes it intact.
+        # Using bash -lc ensures login profile is sourced (needed for conda init).
+        # IMPORTANT: we combine "bash -lc <quoted_cmd>" into one string because
+        # SSH concatenates multiple command args with spaces, which breaks
+        # bash -c's argument parsing (it would only execute the first word).
+        args.append(f"bash -lc {shlex.quote(remote_command)}")
 
         return args
 
