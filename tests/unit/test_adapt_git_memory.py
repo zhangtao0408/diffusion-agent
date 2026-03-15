@@ -6,7 +6,7 @@ from pathlib import Path
 
 from git import Repo
 
-from diffusion_agent.adapt.git_memory import GitMemory
+from diffusion_agent.adapt.git_memory import GitMemory, reset_to_clean_main
 from diffusion_agent.adapt.types import FailureCategory, Hypothesis, Verdict
 
 
@@ -106,3 +106,49 @@ class TestGitMemory:
 
         gm.rollback_last_commit()
         assert not (tmp_path / "test.py").exists()
+
+
+class TestResetToCleanMain:
+    """reset_to_clean_main must return the repo to a pristine main-branch state."""
+
+    def test_removes_adapt_branch_and_files(self, tmp_path: Path) -> None:
+        """After reset, adapt branches are deleted and working tree matches main."""
+        repo = _init_repo(tmp_path)
+
+        # Simulate a previous adapt run: create adapt branch + dirty file
+        gm = GitMemory(tmp_path)
+        gm.ensure_branch("TestModel")
+        (tmp_path / "dirty.py").write_text("hacked\n")
+        repo.index.add(["dirty.py"])
+        repo.index.commit("dirty commit on adapt branch")
+        assert (tmp_path / "dirty.py").exists()
+
+        # Reset
+        reset_to_clean_main(tmp_path)
+
+        # Should be back on main/master
+        repo2 = Repo(str(tmp_path))
+        assert repo2.active_branch.name in ("main", "master")
+        # dirty file from adapt branch should be gone
+        assert not (tmp_path / "dirty.py").exists()
+        # adapt branch should be deleted
+        branch_names = [b.name for b in repo2.branches]
+        assert "adapt/TestModel" not in branch_names
+
+    def test_deletes_diffusion_agent_state_dir(self, tmp_path: Path) -> None:
+        """The .diffusion_agent/ state directory must be removed."""
+        _init_repo(tmp_path)
+        state_dir = tmp_path / ".diffusion_agent"
+        state_dir.mkdir()
+        (state_dir / "state.json").write_text("{}")
+
+        reset_to_clean_main(tmp_path)
+        assert not state_dir.exists()
+
+    def test_idempotent_on_clean_repo(self, tmp_path: Path) -> None:
+        """Calling reset on an already-clean repo should not crash."""
+        _init_repo(tmp_path)
+        reset_to_clean_main(tmp_path)
+        # Should still be on main/master, no error
+        repo = Repo(str(tmp_path))
+        assert repo.active_branch.name in ("main", "master")

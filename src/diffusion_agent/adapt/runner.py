@@ -9,6 +9,7 @@ independent of where commands actually run.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -64,6 +65,55 @@ def normalize_error(stderr: str) -> str:
     if lines:
         return lines[-1][:200]
     return ""
+
+
+def validate_syntax_local(file_paths: list[str]) -> RunResult:
+    """Fast local syntax check using ``ast.parse``.
+
+    Parses each file without executing it.  Returns a :class:`RunResult` with
+    ``exit_code=0`` when all files are syntactically valid, or ``exit_code=1``
+    with the first ``SyntaxError`` details in *stderr* / *error_signature*.
+
+    This is meant to be called **before** expensive remote validation so that
+    obviously broken LLM patches are caught locally in milliseconds rather
+    than after a ~20-second SSH round-trip + execution cycle.
+    """
+    if not file_paths:
+        return RunResult(
+            exit_code=0, stdout="syntax_check_local: no files",
+            stderr="", error_signature="", duration_s=0.0,
+            command="validate_syntax_local",
+        )
+
+    errors: list[str] = []
+    for fp in file_paths:
+        try:
+            source = Path(fp).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue  # skip unreadable files
+        try:
+            ast.parse(source, filename=fp)
+        except SyntaxError as exc:
+            line_info = f"line {exc.lineno}" if exc.lineno else ""
+            msg = f"  File \"{fp}\", {line_info}\nSyntaxError: {exc.msg}"
+            errors.append(msg)
+
+    if errors:
+        stderr = "\n".join(errors)
+        return RunResult(
+            exit_code=1,
+            stdout="",
+            stderr=stderr,
+            error_signature=normalize_error(stderr),
+            duration_s=0.0,
+            command="validate_syntax_local",
+        )
+
+    return RunResult(
+        exit_code=0, stdout=f"syntax_check_local: {len(file_paths)} files OK",
+        stderr="", error_signature="", duration_s=0.0,
+        command="validate_syntax_local",
+    )
 
 
 def _result_from_exec(er: ExecutionResult) -> RunResult:

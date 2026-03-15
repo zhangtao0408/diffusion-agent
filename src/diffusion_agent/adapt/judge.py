@@ -8,17 +8,43 @@ from __future__ import annotations
 
 import re
 
-from diffusion_agent.adapt.types import FailureCategory, RunResult, Verdict
+from diffusion_agent.adapt.types import (
+    AdaptationTask,
+    FailureCategory,
+    RunResult,
+    TaskStopReason,
+    Verdict,
+)
 from diffusion_agent.utils.logging import get_logger
 
 log = get_logger(__name__)
 
-# Patterns that indicate hard blockers (unsupported ops, missing extensions)
+# ---------------------------------------------------------------------------
+# Structured patterns — checked first, in order (most specific wins)
+# ---------------------------------------------------------------------------
+
 _BLOCKER_PATTERNS: list[tuple[str, FailureCategory]] = [
+    # NPU dtype limitations — fixable via view_as_real / safe-cast (MUST precede generic "not implemented")
+    (r"not implemented for DT_(COMPLEX128|COMPLEX64|DOUBLE)", FailureCategory.DTYPE_AUTOCAST),
+    # Unsupported ops (generic fallback)
     (r"not implemented for", FailureCategory.UNSUPPORTED_OP),
     (r"Could not run .*on", FailureCategory.UNSUPPORTED_OP),
     (r"No kernel registered for", FailureCategory.UNSUPPORTED_OP),
+    # Custom extensions
     (r"No module named '(flash_attn|xformers|triton)'", FailureCategory.CUSTOM_EXTENSION),
+    # OOM (must precede generic device/cuda keywords)
+    (r"out of memory", FailureCategory.OOM),
+    (r"OutOfMemoryError", FailureCategory.OOM),
+    # Syntax errors (must precede generic heuristics)
+    (r"SyntaxError:", FailureCategory.SYNTAX_ERROR),
+    (r"IndentationError:", FailureCategory.SYNTAX_ERROR),
+    (r"TabError:", FailureCategory.SYNTAX_ERROR),
+    # Logic / shape bugs
+    (r"shape mismatch", FailureCategory.LOGIC_BUG),
+    (r"size of tensor \w+ \(\d+\) must match", FailureCategory.LOGIC_BUG),
+    (r"shapes cannot be multiplied", FailureCategory.LOGIC_BUG),
+    (r"AssertionError:", FailureCategory.LOGIC_BUG),
+    # Device availability
     (r"CUDA.*not available", FailureCategory.DEVICE_SELECTION),
     (r"nccl.*not available", FailureCategory.DISTRIBUTED_BACKEND),
 ]
@@ -61,6 +87,97 @@ def is_blocker(category: FailureCategory) -> bool:
         FailureCategory.UNSUPPORTED_OP,
         FailureCategory.CUSTOM_EXTENSION,
     }
+
+
+# ---------------------------------------------------------------------------
+# Error context extraction — trims noisy NPU stderr to the relevant traceback
+# ---------------------------------------------------------------------------
+
+def extract_error_context(stderr: str, max_lines: int = 30) -> str:
+    """Extract the most relevant traceback block from stderr.
+
+    Strategy:
+      1. Find the LAST ``Traceback (most recent call last):`` block.
+      2. Return from that line through the exception line.
+      3. Cap at *max_lines* to prevent token explosion.
+      4. If no traceback found, return the tail lines.
+    """
+    if not stderr:
+        return ""
+
+    lines = stderr.splitlines()
+
+    # Find the start of the last traceback block
+    last_tb_start = -1
+    for i, line in enumerate(lines):
+        if "Traceback (most recent call last):" in line:
+            last_tb_start = i
+
+    if last_tb_start >= 0:
+        # Extract from the last traceback to end (the exception line follows)
+        block = lines[last_tb_start:]
+        if len(block) > max_lines:
+            block = block[:max_lines]
+        return "\n".join(block)
+
+    # No traceback — return tail lines
+    tail = lines[-max_lines:] if len(lines) > max_lines else lines
+    return "\n".join(tail)
+
+
+# ---------------------------------------------------------------------------
+# Task-level progress evaluation — consecutive blocker escalation
+# ---------------------------------------------------------------------------
+
+# Categories that trigger auto-block when seen N consecutive times.
+# Only truly un-patchable categories belong here.
+_ESCALATION_CATEGORIES: set[FailureCategory] = {
+    FailureCategory.UNSUPPORTED_OP,
+}
+
+_ESCALATION_THRESHOLD = 3
+
+
+def evaluate_task_progress(
+    task: AdaptationTask,
+    attempt_stderrs: list[str],
+) -> TaskStopReason | None:
+    """Check whether a task should be force-stopped based on attempt history.
+
+    Detects: N consecutive attempts whose stderr classifies as the same
+    escalation-eligible category (e.g. UNSUPPORTED_OP).  When the threshold
+    is reached, returns ``TaskStopReason.BLOCKED``.
+
+    Args:
+        task: The task with recorded attempts.
+        attempt_stderrs: stderr strings for each attempt, in order.
+
+    Returns:
+        ``TaskStopReason.BLOCKED`` if escalation fires, else ``None``.
+    """
+    if len(attempt_stderrs) < _ESCALATION_THRESHOLD:
+        return None
+
+    # Classify the last N stderrs
+    tail = attempt_stderrs[-_ESCALATION_THRESHOLD:]
+    categories = [classify_failure(s) for s in tail]
+
+    # Check: all the same AND in the escalation set
+    if len(set(categories)) == 1 and categories[0] in _ESCALATION_CATEGORIES:
+        log.info(
+            "judge_escalation_blocked",
+            task=task.id,
+            category=categories[0].value,
+            consecutive=_ESCALATION_THRESHOLD,
+        )
+        return TaskStopReason.BLOCKED
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# AdaptJudge — single-iteration verdict
+# ---------------------------------------------------------------------------
 
 
 class AdaptJudge:

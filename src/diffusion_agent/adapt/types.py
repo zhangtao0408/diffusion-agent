@@ -23,6 +23,9 @@ class FailureCategory(str, Enum):
     UNSUPPORTED_OP = "unsupported_op"
     CUSTOM_EXTENSION = "custom_extension"
     DTYPE_AUTOCAST = "dtype_autocast"
+    OOM = "oom"
+    SYNTAX_ERROR = "syntax_error"
+    LOGIC_BUG = "logic_bug"
     RUNTIME_REGRESSION = "runtime_regression"
     UNKNOWN_BLOCKER = "unknown_blocker"
 
@@ -41,6 +44,7 @@ class Hypothesis:
     target_files: list[str]
     proposed_action: str
     source: str = "planner"  # "planner", "rule", "llm"
+    deepest_file: str | None = None  # deepest user-code frame (root cause file)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +54,7 @@ class Hypothesis:
             "target_files": self.target_files,
             "proposed_action": self.proposed_action,
             "source": self.source,
+            "deepest_file": self.deepest_file,
         }
 
 
@@ -335,6 +340,7 @@ class AdaptationState:
     model_name: str
     max_iterations: int = 20
     no_progress_limit: int = 3
+    max_phase_c_iterations: int = 10
 
     # Progress tracking
     iteration: int = 0

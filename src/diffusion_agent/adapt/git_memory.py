@@ -6,6 +6,7 @@ rolled back so the working tree stays clean for the next attempt.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from git import GitCommandError, Repo
@@ -14,6 +15,51 @@ from diffusion_agent.adapt.types import Hypothesis, Verdict
 from diffusion_agent.utils.logging import get_logger
 
 log = get_logger(__name__)
+
+
+def reset_to_clean_main(repo_path: Path) -> None:
+    """Thoroughly reset a target repo to pristine main-branch state.
+
+    This removes all adapt branches, resets the working tree to main,
+    and cleans up ``.diffusion_agent/`` state directory.  Used before
+    E2E runs to prevent pollution from previous runs.
+    """
+    repo = Repo(str(repo_path))
+
+    # 1. Determine main branch name (main or master)
+    main_branch = "main"
+    branch_names = [b.name for b in repo.branches]
+    if "main" not in branch_names and "master" in branch_names:
+        main_branch = "master"
+
+    # 2. Switch to main branch
+    try:
+        repo.git.checkout(main_branch)
+    except GitCommandError:
+        log.warning("reset_checkout_failed", branch=main_branch)
+
+    # 3. Hard reset to match the branch HEAD
+    repo.git.reset("--hard", main_branch)
+
+    # 4. Clean untracked files and directories
+    repo.git.clean("-fd")
+
+    # 5. Delete all adapt/* branches
+    for branch in list(repo.branches):
+        if branch.name.startswith("adapt/"):
+            try:
+                repo.git.branch("-D", branch.name)
+                log.info("reset_branch_deleted", branch=branch.name)
+            except GitCommandError:
+                log.warning("reset_branch_delete_failed", branch=branch.name)
+
+    # 6. Remove .diffusion_agent/ state directory
+    state_dir = repo_path / ".diffusion_agent"
+    if state_dir.exists():
+        shutil.rmtree(state_dir)
+        log.info("reset_state_dir_removed", path=str(state_dir))
+
+    log.info("reset_to_clean_main_done", branch=main_branch)
 
 
 class GitMemory:

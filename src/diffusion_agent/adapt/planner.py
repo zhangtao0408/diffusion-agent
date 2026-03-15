@@ -7,6 +7,7 @@ patches or execute commands.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from diffusion_agent.adapt.types import (
@@ -39,6 +40,10 @@ _PATTERN_CATEGORY: dict[PatternType, FailureCategory] = {
     PatternType.BFLOAT16: FailureCategory.DTYPE_AUTOCAST,
     PatternType.DISTRIBUTED: FailureCategory.DISTRIBUTED_BACKEND,
     PatternType.SDPA: FailureCategory.CUDA_ONLY_API,
+    PatternType.CUDA_AMP: FailureCategory.CUDA_ONLY_API,
+    PatternType.TORCH_IMPORT: FailureCategory.IMPORT_MODULE,
+    PatternType.AUTOCAST_DTYPE: FailureCategory.DTYPE_AUTOCAST,
+    PatternType.DTYPE_ASSERT: FailureCategory.LOGIC_BUG,
 }
 
 # Priority order for deterministic task decomposition
@@ -50,10 +55,161 @@ _CATEGORY_PRIORITY: list[FailureCategory] = [
     FailureCategory.DISTRIBUTED_BACKEND, # nccl → hccl
     FailureCategory.DTYPE_AUTOCAST,      # float64, bfloat16
     FailureCategory.UNSUPPORTED_OP,
+    FailureCategory.OOM,
+    FailureCategory.SYNTAX_ERROR,
+    FailureCategory.LOGIC_BUG,
     FailureCategory.ENVIRONMENT_SETUP,
     FailureCategory.RUNTIME_REGRESSION,
     FailureCategory.UNKNOWN_BLOCKER,
 ]
+
+
+# ---------------------------------------------------------------------------
+# Error log trimming — prevents token explosion in LLM context
+# ---------------------------------------------------------------------------
+
+def trim_error_log(stderr: str, max_lines: int = 30) -> str:
+    """Extract the most relevant traceback from stderr, capped at *max_lines*.
+
+    Strategy:
+      1. Find the LAST ``Traceback (most recent call last):`` block.
+      2. Collect from that line through the final exception line.
+      3. If the block exceeds *max_lines*, keep the traceback header,
+         the last frames, and always the exception line.
+      4. If no traceback found, return the tail lines.
+    """
+    if not stderr:
+        return ""
+
+    lines = stderr.splitlines()
+
+    # Find the start of the last traceback block
+    last_tb_start = -1
+    for i, line in enumerate(lines):
+        if "Traceback (most recent call last):" in line:
+            last_tb_start = i
+
+    if last_tb_start >= 0:
+        block = lines[last_tb_start:]
+        if len(block) <= max_lines:
+            return "\n".join(block)
+
+        # Block too long — keep header + tail with exception line
+        # Always include: first line (Traceback header) + last (max_lines-1) lines
+        header = [block[0]]
+        tail = block[-(max_lines - 1):]
+        return "\n".join(header + tail)
+
+    # No traceback — return tail lines
+    tail = lines[-max_lines:] if len(lines) > max_lines else lines
+    return "\n".join(tail)
+
+
+# ---------------------------------------------------------------------------
+# Reflection context builder — "error notebook" for the LLM
+# ---------------------------------------------------------------------------
+
+def _build_reflection_context(task: AdaptationTask) -> str:
+    """Build a reflection prompt from the task's previous attempt history.
+
+    Returns an empty string if there are no prior attempts.
+    """
+    if not task.attempts:
+        return ""
+
+    last = task.attempts[-1]
+    parts: list[str] = []
+
+    parts.append(
+        f"[REFLECTION] Previous attempt #{last.attempt} "
+        f"tried: {last.hypothesis.proposed_action}"
+    )
+    if last.error_signature:
+        parts.append(f"  Result: FAILED with error -> {last.error_signature}")
+    else:
+        parts.append(f"  Result: verdict={last.verdict.value}, no error signature captured")
+    parts.append(
+        "  Analyze why the previous fix failed and propose a DIFFERENT approach."
+    )
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Traceback file extraction — maps runtime errors to source files
+# ---------------------------------------------------------------------------
+
+_TB_FILE_RE = re.compile(r'File "([^"]+\.py)", line (\d+)')
+
+# Paths containing any of these substrings are considered stdlib/venv noise
+_SKIP_SUBSTRINGS = (
+    "site-packages", "/lib/python", "/usr/lib/",
+    "<frozen", "<string>", ".venv/", "/.local/",
+)
+
+
+def parse_traceback_files(
+    stderr: str,
+    repo_path: Path | None = None,
+    remote_workdir: str | None = None,
+) -> list[str]:
+    """Extract file paths from a Python traceback and resolve to local repo paths.
+
+    Handles both local paths (already in repo) and remote paths (from SSH execution).
+    Filters out stdlib / site-packages.  Returns **local absolute paths** that exist
+    on disk, ordered by last-seen (the most relevant frame is last in a traceback).
+    """
+    if not stderr or repo_path is None:
+        return []
+
+    raw_paths: list[str] = []
+    for match in _TB_FILE_RE.finditer(stderr):
+        raw_paths.append(match.group(1))
+
+    if not raw_paths:
+        return []
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+
+    # Process in reverse so the deepest (most relevant) frame comes first
+    for raw in reversed(raw_paths):
+        if any(skip in raw for skip in _SKIP_SUBSTRINGS):
+            continue
+
+        p = Path(raw)
+
+        # 1. Direct resolution: path is already inside repo_path
+        if p.is_absolute():
+            try:
+                rel = p.relative_to(repo_path)
+                local = str(repo_path / rel)
+                if local not in seen and Path(local).exists():
+                    resolved.append(local)
+                    seen.add(local)
+                    continue
+            except ValueError:
+                pass
+
+        # 2. Strip remote_workdir prefix to get a relative path
+        if remote_workdir:
+            remote_prefix = remote_workdir.rstrip("/") + "/"
+            if raw.startswith(remote_prefix):
+                rel = raw[len(remote_prefix):]
+                local = str(repo_path / rel)
+                if local not in seen and Path(local).exists():
+                    resolved.append(local)
+                    seen.add(local)
+                    continue
+
+        # 3. Fallback: match by filename within repo
+        name = p.name
+        candidates = list(repo_path.rglob(name))
+        if len(candidates) == 1 and str(candidates[0]) not in seen:
+            resolved.append(str(candidates[0]))
+            seen.add(str(candidates[0]))
+
+    return resolved
 
 
 class AdaptPlanner:
@@ -173,12 +329,23 @@ class AdaptPlanner:
                 )
                 return None  # signal: no new hypothesis available
 
+        # Build reflection context from prior attempts (the "error notebook")
+        reflection = _build_reflection_context(task)
+
+        if reflection:
+            proposed_action = (
+                f"{reflection}\n"
+                f"Use LLM to propose fix for: {pattern_desc}"
+            )
+        else:
+            proposed_action = f"Use LLM to propose fix for: {pattern_desc}"
+
         return Hypothesis(
             id=hyp_id,
             category=task.category,
             description=f"LLM-assisted fix for {pattern_desc} in {Path(task.target_files[0]).name}",
             target_files=task.target_files,
-            proposed_action=f"Use LLM to propose fix for: {pattern_desc}",
+            proposed_action=proposed_action,
             source="llm",
         )
 
@@ -186,11 +353,17 @@ class AdaptPlanner:
         self,
         run_result: RunResult,
         previous_iterations: list[IterationRecord],
+        repo_path: Path | None = None,
+        remote_workdir: str | None = None,
     ) -> Hypothesis | None:
         """Generate a hypothesis from a runtime failure (post-rule-application).
 
         This is used in the iterative loop when deterministic rules have been
-        applied but the code still fails at runtime.
+        applied but the code still fails at runtime.  Uses trimmed error
+        context to keep the LLM prompt within token budget.
+
+        When *repo_path* is provided, the traceback is parsed to extract
+        the target file(s) so the PatchWorker knows which files to patch.
         """
         from diffusion_agent.adapt.judge import classify_failure
 
@@ -205,13 +378,31 @@ class AdaptPlanner:
             log.info("planner_repeated_error", sig=run_result.error_signature[:80])
             return None  # signal repeated failure
 
+        # Use trimmed error context instead of raw error_signature
+        trimmed = trim_error_log(run_result.stderr)
+        description = f"Fix runtime failure:\n{trimmed}" if trimmed else (
+            f"Fix runtime failure: {run_result.error_signature[:80]}"
+        )
+
+        # Parse traceback to identify target files
+        target_files = parse_traceback_files(
+            run_result.stderr, repo_path, remote_workdir,
+        )
+        if target_files:
+            log.info(
+                "planner_runtime_target_files",
+                files=target_files[:5],
+                error_sig=run_result.error_signature[:60],
+            )
+
         return Hypothesis(
             id=f"hyp-runtime-{len(previous_iterations) + 1}",
             category=category,
-            description=f"Fix runtime failure: {run_result.error_signature[:80]}",
-            target_files=[],  # runner determines affected files
+            description=description,
+            target_files=target_files,
             proposed_action=f"Investigate and fix: {category.value}",
             source="llm",
+            deepest_file=target_files[0] if target_files else None,
         )
 
     # ----- Previous attempt analysis -----

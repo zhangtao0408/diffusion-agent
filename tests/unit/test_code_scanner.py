@@ -200,3 +200,239 @@ class TestScanDirectory:
 
     def test_empty_directory(self, tmp_path: Path) -> None:
         assert scan_directory(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# PatternType: torch.cuda.amp
+# ---------------------------------------------------------------------------
+
+class TestTorchImport:
+    """Task 1: Scanner must detect `import torch` as TORCH_IMPORT."""
+
+    def test_detect_import_torch(self, tmp_path: Path) -> None:
+        src = _write(tmp_path, "a.py", "import torch\nx = 1\n")
+        findings = scan_file(src)
+        ti = [f for f in findings if f.pattern_type == PatternType.TORCH_IMPORT]
+        assert len(ti) == 1
+        assert ti[0].line_number == 1
+
+    def test_detect_from_torch_import(self, tmp_path: Path) -> None:
+        src = _write(tmp_path, "a.py", "from torch import nn\n")
+        findings = scan_file(src)
+        ti = [f for f in findings if f.pattern_type == PatternType.TORCH_IMPORT]
+        assert len(ti) == 1
+
+    def test_not_detect_import_torchvision(self, tmp_path: Path) -> None:
+        """import torchvision should NOT trigger TORCH_IMPORT."""
+        src = _write(tmp_path, "a.py", "import torchvision\n")
+        findings = scan_file(src)
+        ti = [f for f in findings if f.pattern_type == PatternType.TORCH_IMPORT]
+        assert len(ti) == 0
+
+    def test_not_detect_import_torch_npu(self, tmp_path: Path) -> None:
+        """import torch_npu should NOT trigger TORCH_IMPORT."""
+        src = _write(tmp_path, "a.py", "import torch_npu\n")
+        findings = scan_file(src)
+        ti = [f for f in findings if f.pattern_type == PatternType.TORCH_IMPORT]
+        assert len(ti) == 0
+
+    def test_only_first_import_torch_detected(self, tmp_path: Path) -> None:
+        """Multiple `import torch` should each be detected (scanner reports all)."""
+        code = "import torch\nimport os\nimport torch\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        ti = [f for f in findings if f.pattern_type == PatternType.TORCH_IMPORT]
+        assert len(ti) == 2
+
+
+class TestCudaDeviceStrEnhanced:
+    """Task 2: Scanner must detect cuda device strings in f-strings, spaces, two-arg."""
+
+    def test_detect_fstring_cuda(self, tmp_path: Path) -> None:
+        """f'cuda:{device_id}' should be detected as CUDA_DEVICE_STR."""
+        src = _write(tmp_path, "a.py", 'self.device = torch.device(f"cuda:{device_id}")\n')
+        findings = scan_file(src)
+        ds = [f for f in findings if f.pattern_type == PatternType.CUDA_DEVICE_STR]
+        assert len(ds) >= 1
+
+    def test_detect_cuda_with_spaces(self, tmp_path: Path) -> None:
+        """'cuda: 0' (space after colon) should be detected."""
+        src = _write(tmp_path, "a.py", 'device = torch.device("cuda: 0")\n')
+        findings = scan_file(src)
+        ds = [f for f in findings if f.pattern_type == PatternType.CUDA_DEVICE_STR]
+        assert len(ds) >= 1
+
+    def test_detect_cuda_two_arg_device(self, tmp_path: Path) -> None:
+        """torch.device('cuda', device_id) should be detected."""
+        src = _write(tmp_path, "a.py", 'dev = torch.device("cuda", device_id)\n')
+        findings = scan_file(src)
+        ds = [f for f in findings if f.pattern_type == PatternType.CUDA_DEVICE_STR]
+        assert len(ds) >= 1
+
+
+class TestAutocastDtype:
+    """Scanner must detect autocast calls with dtype=torch.float32."""
+
+    def test_detect_autocast_float32(self, tmp_path: Path) -> None:
+        code = "with torch.amp.autocast('npu', dtype=torch.float32):\n    pass\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        ac = [f for f in findings if f.pattern_type == PatternType.AUTOCAST_DTYPE]
+        assert len(ac) == 1
+
+    def test_no_detect_autocast_without_dtype(self, tmp_path: Path) -> None:
+        code = "with torch.amp.autocast('npu'):\n    pass\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        ac = [f for f in findings if f.pattern_type == PatternType.AUTOCAST_DTYPE]
+        assert len(ac) == 0
+
+    def test_detect_decorator_autocast(self, tmp_path: Path) -> None:
+        code = "@torch.amp.autocast('npu', dtype=torch.float32)\ndef foo(): pass\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        ac = [f for f in findings if f.pattern_type == PatternType.AUTOCAST_DTYPE]
+        assert len(ac) == 1
+
+
+class TestDtypeAssert:
+    """Scanner must detect assert ... .dtype == torch.float32."""
+
+    def test_detect_single_assert(self, tmp_path: Path) -> None:
+        code = "assert e.dtype == torch.float32\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        da = [f for f in findings if f.pattern_type == PatternType.DTYPE_ASSERT]
+        assert len(da) == 1
+
+    def test_detect_compound_assert(self, tmp_path: Path) -> None:
+        code = "assert e.dtype == torch.float32 and e0.dtype == torch.float32\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        da = [f for f in findings if f.pattern_type == PatternType.DTYPE_ASSERT]
+        assert len(da) == 1
+
+    def test_detect_subscript_assert(self, tmp_path: Path) -> None:
+        code = "assert e[0].dtype == torch.float32\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        da = [f for f in findings if f.pattern_type == PatternType.DTYPE_ASSERT]
+        assert len(da) == 1
+
+    def test_no_detect_other_dtype(self, tmp_path: Path) -> None:
+        code = "assert e.dtype == torch.float16\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        da = [f for f in findings if f.pattern_type == PatternType.DTYPE_ASSERT]
+        assert len(da) == 0
+
+
+class TestCudaAmp:
+    def test_detect_import_torch_cuda_amp(self, tmp_path: Path) -> None:
+        """Detect `import torch.cuda.amp as amp`."""
+        src = _write(tmp_path, "a.py", "import torch.cuda.amp as amp\n")
+        findings = scan_file(src)
+        assert len(findings) >= 1
+        amp_findings = [f for f in findings if f.pattern_type == PatternType.CUDA_AMP]
+        assert len(amp_findings) == 1
+        assert amp_findings[0].line_number == 1
+
+    def test_detect_from_torch_cuda_amp_import(self, tmp_path: Path) -> None:
+        """Detect `from torch.cuda.amp import autocast, GradScaler`."""
+        src = _write(tmp_path, "a.py", "from torch.cuda.amp import autocast, GradScaler\n")
+        findings = scan_file(src)
+        amp_findings = [f for f in findings if f.pattern_type == PatternType.CUDA_AMP]
+        assert len(amp_findings) == 1
+
+    def test_detect_import_torch_cuda_amp_plain(self, tmp_path: Path) -> None:
+        """Detect `import torch.cuda.amp` (no alias)."""
+        src = _write(tmp_path, "a.py", "import torch.cuda.amp\n")
+        findings = scan_file(src)
+        amp_findings = [f for f in findings if f.pattern_type == PatternType.CUDA_AMP]
+        assert len(amp_findings) == 1
+
+
+# ---------------------------------------------------------------------------
+# PatternType: flash_attn_usage
+# ---------------------------------------------------------------------------
+
+class TestFlashAttnUsage:
+    def test_flash_attn_usage_assert_detected(self, tmp_path: Path) -> None:
+        """assert FLASH_ATTN_2_AVAILABLE should be detected as FLASH_ATTN_USAGE."""
+        src = _write(tmp_path, "a.py", "FLASH_ATTN_2_AVAILABLE = False\nassert FLASH_ATTN_2_AVAILABLE\n")
+        findings = scan_file(src)
+        usage = [f for f in findings if f.pattern_type == PatternType.FLASH_ATTN_USAGE]
+        assert len(usage) == 1
+        assert usage[0].line_number == 2
+
+    def test_flash_attn_usage_function_call_detected(self, tmp_path: Path) -> None:
+        """flash_attn.flash_attn_varlen_func() should be detected."""
+        code = "import flash_attn\nout = flash_attn.flash_attn_varlen_func(q, k, v)\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        usage = [f for f in findings if f.pattern_type == PatternType.FLASH_ATTN_USAGE]
+        assert len(usage) == 1
+        assert usage[0].line_number == 2
+
+    def test_flash_attn_usage_not_false_positive_on_import(self, tmp_path: Path) -> None:
+        """import flash_attn should NOT be detected as FLASH_ATTN_USAGE (it's FLASH_ATTN)."""
+        src = _write(tmp_path, "a.py", "import flash_attn\n")
+        findings = scan_file(src)
+        usage = [f for f in findings if f.pattern_type == PatternType.FLASH_ATTN_USAGE]
+        assert len(usage) == 0
+
+    def test_flash_attn_usage_pattern_type_exists(self) -> None:
+        """PatternType.FLASH_ATTN_USAGE must exist."""
+        assert hasattr(PatternType, "FLASH_ATTN_USAGE")
+        assert PatternType.FLASH_ATTN_USAGE.value == "flash_attn_usage"
+
+    def test_flash_attn_usage_skips_comment_lines(self, tmp_path: Path) -> None:
+        """Commented-out flash_attn usage (# [NPU] ...) should NOT generate findings."""
+        code = (
+            "import torch\n"
+            "# [NPU] x = flash_attn.flash_attn_varlen_func(q, k, v)\n"
+            "x = _npu_varlen_attention(q, k, v)\n"
+        )
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        usage = [f for f in findings if f.pattern_type == PatternType.FLASH_ATTN_USAGE]
+        assert len(usage) == 0
+
+
+# ---------------------------------------------------------------------------
+# PatternType: autocast_no_device
+# ---------------------------------------------------------------------------
+
+class TestAutocastNoDevice:
+    def test_detect_amp_autocast_missing_device(self, tmp_path: Path) -> None:
+        """amp.autocast(dtype=...) without device_type should be detected."""
+        code = "import torch.amp as amp\nwith amp.autocast(dtype=torch.float):\n    pass\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        hits = [f for f in findings if f.pattern_type == PatternType.AUTOCAST_NO_DEVICE]
+        assert len(hits) == 1
+        assert hits[0].line_number == 2
+
+    def test_detect_decorator_autocast_missing_device(self, tmp_path: Path) -> None:
+        """@amp.autocast(enabled=False) without device_type should be detected."""
+        code = "import torch.amp as amp\n@amp.autocast(enabled=False)\ndef foo(): pass\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        hits = [f for f in findings if f.pattern_type == PatternType.AUTOCAST_NO_DEVICE]
+        assert len(hits) == 1
+
+    def test_skip_autocast_with_device(self, tmp_path: Path) -> None:
+        """amp.autocast('npu', dtype=...) should NOT be detected (already has device_type)."""
+        code = "import torch.amp as amp\nwith amp.autocast('npu', dtype=torch.bfloat16):\n    pass\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        hits = [f for f in findings if f.pattern_type == PatternType.AUTOCAST_NO_DEVICE]
+        assert len(hits) == 0
+
+    def test_skip_torch_cuda_amp_autocast(self, tmp_path: Path) -> None:
+        """torch.cuda.amp.autocast(dtype=...) should NOT match (handled by CudaAmpRule)."""
+        code = "import torch\nwith torch.cuda.amp.autocast(dtype=torch.float):\n    pass\n"
+        src = _write(tmp_path, "a.py", code)
+        findings = scan_file(src)
+        hits = [f for f in findings if f.pattern_type == PatternType.AUTOCAST_NO_DEVICE]
+        assert len(hits) == 0

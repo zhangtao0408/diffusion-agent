@@ -6,7 +6,12 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from diffusion_agent.adapt.executors import ExecutionResult, LocalExecutor, SSHExecutor
-from diffusion_agent.adapt.runner import AdaptRunner, create_executor, normalize_error
+from diffusion_agent.adapt.runner import (
+    AdaptRunner,
+    create_executor,
+    normalize_error,
+    validate_syntax_local,
+)
 from diffusion_agent.adapt.types import ExecutionConfig
 
 
@@ -186,3 +191,63 @@ class TestCreateExecutor:
         cfg = ExecutionConfig(mode="ssh")  # no host → local
         ex = create_executor(cfg)
         assert isinstance(ex, LocalExecutor)
+
+
+# ---------------------------------------------------------------------------
+# validate_syntax_local — fast local syntax check using ast.parse
+# ---------------------------------------------------------------------------
+
+
+class TestValidateSyntaxLocal:
+    """Fast-fail local syntax check before expensive remote validation."""
+
+    def test_valid_python_passes(self, tmp_path: Path) -> None:
+        """Valid Python files should pass with exit_code=0."""
+        (tmp_path / "ok.py").write_text("x = 1\nprint(x)\n")
+        result = validate_syntax_local([str(tmp_path / "ok.py")])
+        assert result.exit_code == 0
+        assert result.error_signature == ""
+
+    def test_syntax_error_detected(self, tmp_path: Path) -> None:
+        """A file with a SyntaxError should fail with exit_code=1."""
+        (tmp_path / "bad.py").write_text('def foo(\n  x = "unterminated\n')
+        result = validate_syntax_local([str(tmp_path / "bad.py")])
+        assert result.exit_code == 1
+        assert "SyntaxError" in result.error_signature
+
+    def test_unterminated_string_literal(self, tmp_path: Path) -> None:
+        """Detects unterminated string literal — the exact error from Wan2.2 E2E."""
+        (tmp_path / "init.py").write_text(
+            'raise RuntimeError("AudioEncoder unavailable: librosa not installed.\n'
+        )
+        result = validate_syntax_local([str(tmp_path / "init.py")])
+        assert result.exit_code == 1
+        assert "SyntaxError" in result.error_signature
+
+    def test_multiple_files_one_bad(self, tmp_path: Path) -> None:
+        """If any file has a SyntaxError, the check fails."""
+        (tmp_path / "good.py").write_text("x = 1\n")
+        (tmp_path / "bad.py").write_text("def (:\n")
+        result = validate_syntax_local([
+            str(tmp_path / "good.py"),
+            str(tmp_path / "bad.py"),
+        ])
+        assert result.exit_code == 1
+        assert "bad.py" in result.stderr
+
+    def test_empty_file_list_passes(self) -> None:
+        """No files to check → success."""
+        result = validate_syntax_local([])
+        assert result.exit_code == 0
+
+    def test_nonexistent_file_skipped(self, tmp_path: Path) -> None:
+        """Nonexistent files should not crash the check."""
+        result = validate_syntax_local([str(tmp_path / "nope.py")])
+        assert result.exit_code == 0  # no parseable files → pass
+
+    def test_stderr_contains_file_and_line(self, tmp_path: Path) -> None:
+        """The error output should identify the broken file."""
+        (tmp_path / "broken.py").write_text("class (\n")
+        result = validate_syntax_local([str(tmp_path / "broken.py")])
+        assert result.exit_code == 1
+        assert "broken.py" in result.stderr

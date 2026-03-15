@@ -233,15 +233,112 @@ class PatchWorker:
             migration_results=results,
         )
 
+    def apply_runtime_llm_patch(
+        self,
+        hypothesis: Hypothesis,
+    ) -> PatchResult:
+        """Apply LLM patch for a runtime error (no static findings needed).
+
+        Uses the hypothesis description (which contains the trimmed traceback)
+        and target_files to ask the LLM for a fix.  This is the Phase C code
+        path where errors come from actual execution, not static scanning.
+        """
+        if self.llm is None:
+            return PatchResult(
+                hypothesis_id=hypothesis.id,
+                files_changed=[],
+                rules_applied=[],
+                description="LLM not configured — skipping runtime patch",
+                success=True,
+            )
+
+        if not hypothesis.target_files:
+            return PatchResult(
+                hypothesis_id=hypothesis.id,
+                files_changed=[],
+                rules_applied=[],
+                description="No target files identified from traceback",
+                success=True,
+            )
+
+        try:
+            from diffusion_agent.tools.llm_migrator import (
+                apply_llm_fixes,
+                fix_runtime_error,
+            )
+
+            # Read target file contents
+            file_contents: dict[str, str] = {}
+            for fp in hypothesis.target_files:
+                try:
+                    file_contents[fp] = Path(fp).read_text("utf-8")
+                except (OSError, UnicodeDecodeError):
+                    pass
+
+            if not file_contents:
+                return PatchResult(
+                    hypothesis_id=hypothesis.id,
+                    files_changed=[],
+                    rules_applied=[],
+                    description="Could not read target files",
+                    success=True,
+                )
+
+            # Extract error context from hypothesis description
+            error_context = hypothesis.description
+            prefix = "Fix runtime failure:\n"
+            if error_context.startswith(prefix):
+                error_context = error_context[len(prefix):]
+
+            llm_fixes = fix_runtime_error(
+                self.llm, error_context, file_contents,
+                deepest_file=hypothesis.deepest_file,
+            )
+            results = apply_llm_fixes(llm_fixes)
+
+            modified = [r.file_path for r in results if r.success and r.applied_rules]
+            for fp in modified:
+                add_torch_npu_import(fp)
+
+            all_rules: list[str] = []
+            for r in results:
+                all_rules.extend(r.applied_rules)
+
+            return PatchResult(
+                hypothesis_id=hypothesis.id,
+                files_changed=modified,
+                rules_applied=all_rules,
+                description=f"Runtime LLM fix: {len(all_rules)} change(s) in {len(modified)} file(s)",
+                success=True,
+                migration_results=results,
+            )
+        except Exception as exc:
+            log.warning("runtime_llm_patch_failed", error=str(exc))
+            return PatchResult(
+                hypothesis_id=hypothesis.id,
+                files_changed=[],
+                rules_applied=[],
+                description=f"Runtime LLM patch failed: {exc}",
+                success=False,
+                error=str(exc),
+            )
+
     def apply_patch(
         self,
         hypothesis: Hypothesis,
         findings: list[Finding],
     ) -> PatchResult:
-        """Dispatch to the right patch method based on hypothesis source."""
+        """Dispatch to the right patch method based on hypothesis source.
+
+        For LLM hypotheses with no static findings but identified target files
+        (i.e., runtime errors from Phase C), routes to ``apply_runtime_llm_patch``.
+        """
         if hypothesis.source == "rule":
             return self.apply_rule_patch(hypothesis, findings)
         elif hypothesis.source == "llm":
+            # Runtime error path: no static findings, but target files from traceback
+            if not findings and hypothesis.target_files:
+                return self.apply_runtime_llm_patch(hypothesis)
             return self.apply_llm_patch(hypothesis, findings)
         else:
             return self.apply_rule_patch(hypothesis, findings)

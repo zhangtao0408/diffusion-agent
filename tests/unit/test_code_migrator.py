@@ -5,18 +5,25 @@ from __future__ import annotations
 from pathlib import Path
 
 from diffusion_agent.tools.code_migrator import (
+    AutocastDeviceRule,
+    AutocastDtypeRule,
+    CudaAmpRule,
     CudaApiRule,
     CudaCallRule,
     CudaDeviceStrRule,
     CudaToRule,
+    DtypeAssertRule,
     Float64Rule,
     FlashAttnRule,
+    FlashAttnUsageRule,
     MigrationRule,
     NcclToHcclRule,
+    NpuInitInjectorRule,
     RuleRegistry,
     XformersRule,
     add_torch_npu_import,
     apply_all_migrations,
+    apply_migration,
     create_default_registry,
 )
 from diffusion_agent.tools.code_scanner import Finding, PatternType
@@ -60,11 +67,17 @@ class TestRuleRegistry:
             (PatternType.CUDA_CALL, "cuda_call"),
             (PatternType.CUDA_TO, "cuda_to"),
             (PatternType.CUDA_API, "cuda_api"),
+            (PatternType.CUDA_AMP, "cuda_amp"),
             (PatternType.CUDA_DEVICE_STR, "cuda_device_str"),
             (PatternType.NCCL, "nccl_to_hccl"),
             (PatternType.FLASH_ATTN, "flash_attn"),
+            (PatternType.FLASH_ATTN_USAGE, "flash_attn_usage"),
             (PatternType.XFORMERS, "xformers"),
             (PatternType.FLOAT64, "float64"),
+            (PatternType.TORCH_IMPORT, "npu_init_injector"),
+            (PatternType.AUTOCAST_NO_DEVICE, "autocast_device"),
+            (PatternType.AUTOCAST_DTYPE, "autocast_dtype"),
+            (PatternType.DTYPE_ASSERT, "dtype_assert"),
         ]:
             finding = _finding("/tmp/x.py", 1, ptype)
             rule = registry.match(finding)
@@ -81,7 +94,7 @@ class TestRuleRegistry:
 
     def test_default_registry_has_all_builtins(self) -> None:
         registry = create_default_registry()
-        assert len(registry.get_rules()) == 8
+        assert len(registry.get_rules()) == 14
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +156,170 @@ class TestCudaDeviceStrRule:
         finding = _finding(str(p), 1, PatternType.CUDA_DEVICE_STR)
         result = CudaDeviceStrRule().apply(p.read_text(), finding)
         assert '.startswith("npu")' in result
+
+    # --- Task 2: Enhanced device string handling ---
+
+    def test_cuda_with_space_before_colon(self, tmp_path: Path) -> None:
+        """Handle 'cuda :0' (space before colon)."""
+        p = _write(tmp_path, "a.py", 'device = torch.device("cuda :0")\n')
+        finding = _finding(str(p), 1, PatternType.CUDA_DEVICE_STR)
+        result = CudaDeviceStrRule().apply(p.read_text(), finding)
+        assert "cuda" not in result
+        assert "npu" in result
+
+    def test_cuda_with_space_after_colon(self, tmp_path: Path) -> None:
+        """Handle 'cuda: 0' (space after colon)."""
+        p = _write(tmp_path, "a.py", 'device = torch.device("cuda: 0")\n')
+        finding = _finding(str(p), 1, PatternType.CUDA_DEVICE_STR)
+        result = CudaDeviceStrRule().apply(p.read_text(), finding)
+        assert "cuda" not in result
+        assert "npu" in result
+
+    def test_cuda_with_spaces_around_colon(self, tmp_path: Path) -> None:
+        """Handle 'cuda : 0' (spaces both sides)."""
+        p = _write(tmp_path, "a.py", 'device = torch.device("cuda : 0")\n')
+        finding = _finding(str(p), 1, PatternType.CUDA_DEVICE_STR)
+        result = CudaDeviceStrRule().apply(p.read_text(), finding)
+        assert "cuda" not in result
+        assert "npu" in result
+
+    def test_fstring_cuda_device_id(self, tmp_path: Path) -> None:
+        """Handle f'cuda:{device_id}' → f'npu:{device_id}'."""
+        p = _write(tmp_path, "a.py", 'self.device = torch.device(f"cuda:{device_id}")\n')
+        finding = _finding(str(p), 1, PatternType.CUDA_DEVICE_STR)
+        result = CudaDeviceStrRule().apply(p.read_text(), finding)
+        assert "cuda" not in result
+        assert "npu" in result
+
+    def test_fstring_cuda_bare(self, tmp_path: Path) -> None:
+        """Handle f'cuda:{rank}' where cuda is a prefix."""
+        p = _write(tmp_path, "a.py", 'device = f"cuda:{rank}"\n')
+        finding = _finding(str(p), 1, PatternType.CUDA_DEVICE_STR)
+        result = CudaDeviceStrRule().apply(p.read_text(), finding)
+        assert "cuda" not in result
+        assert "npu" in result
+
+    def test_torch_device_two_args(self, tmp_path: Path) -> None:
+        """Handle torch.device('cuda', device_id) → torch.device('npu', device_id)."""
+        p = _write(tmp_path, "a.py", 'dev = torch.device("cuda", device_id)\n')
+        finding = _finding(str(p), 1, PatternType.CUDA_DEVICE_STR)
+        result = CudaDeviceStrRule().apply(p.read_text(), finding)
+        assert '"npu"' in result
+        assert '"cuda"' not in result
+
+
+class TestAutocastDtypeRule:
+    """Replace dtype=torch.float32 with dtype=torch.bfloat16 in autocast calls."""
+
+    def test_autocast_float32_to_bfloat16(self, tmp_path: Path) -> None:
+        code = "with torch.amp.autocast('npu', dtype=torch.float32):\n    pass\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.AUTOCAST_DTYPE)
+        result = AutocastDtypeRule().apply(p.read_text(), finding)
+        assert "dtype=torch.bfloat16" in result
+        assert "dtype=torch.float32" not in result
+
+    def test_preserves_other_args(self, tmp_path: Path) -> None:
+        code = "with torch.amp.autocast('npu', dtype=torch.float32, enabled=True):\n    pass\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.AUTOCAST_DTYPE)
+        result = AutocastDtypeRule().apply(p.read_text(), finding)
+        assert "dtype=torch.bfloat16" in result
+        assert "enabled=True" in result
+
+    def test_decorator_autocast(self, tmp_path: Path) -> None:
+        code = "@torch.amp.autocast('npu', dtype=torch.float32)\ndef foo(): pass\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.AUTOCAST_DTYPE)
+        result = AutocastDtypeRule().apply(p.read_text(), finding)
+        assert "dtype=torch.bfloat16" in result
+        assert "dtype=torch.float32" not in result
+
+
+class TestDtypeAssertRule:
+    """Downgrade assert ... .dtype == torch.float32 to rank-0 warning."""
+
+    def test_single_assert_downgraded(self, tmp_path: Path) -> None:
+        code = "    assert e.dtype == torch.float32\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.DTYPE_ASSERT)
+        result = DtypeAssertRule().apply(p.read_text(), finding)
+        assert "assert" not in result or "# [NPU]" in result
+        assert "logging.warning" in result
+        assert "RANK" in result
+
+    def test_compound_assert_downgraded(self, tmp_path: Path) -> None:
+        code = "            assert e.dtype == torch.float32 and e0.dtype == torch.float32\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.DTYPE_ASSERT)
+        result = DtypeAssertRule().apply(p.read_text(), finding)
+        assert "assert e.dtype" not in result or "# [NPU]" in result
+        assert "logging.warning" in result
+
+    def test_preserves_indentation(self, tmp_path: Path) -> None:
+        code = "        assert e.dtype == torch.float32\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.DTYPE_ASSERT)
+        result = DtypeAssertRule().apply(p.read_text(), finding)
+        # Warning line must have at least the same indentation
+        for line in result.splitlines():
+            if "logging.warning" in line:
+                assert line.startswith("        ")
+
+    def test_result_is_valid_python(self, tmp_path: Path) -> None:
+        code = "import os, logging\nassert e.dtype == torch.float32\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 2, PatternType.DTYPE_ASSERT)
+        result = DtypeAssertRule().apply(p.read_text(), finding)
+        compile(result, "<test>", "exec")
+
+
+class TestNpuInitInjectorRule:
+    """Task 1: NpuInitInjectorRule — injects torch_npu + transfer_to_npu via rule registry."""
+
+    def test_inject_both_lines(self, tmp_path: Path) -> None:
+        p = _write(tmp_path, "a.py", "import torch\nx = 1\n")
+        finding = _finding(str(p), 1, PatternType.TORCH_IMPORT)
+        rule = NpuInitInjectorRule()
+        result = rule.apply(p.read_text(), finding)
+        assert "import torch_npu" in result
+        assert "from torch_npu.contrib import transfer_to_npu" in result
+
+    def test_injection_order(self, tmp_path: Path) -> None:
+        """torch_npu must come right after import torch, transfer_to_npu right after that."""
+        p = _write(tmp_path, "a.py", "import torch\nimport os\n")
+        finding = _finding(str(p), 1, PatternType.TORCH_IMPORT)
+        result = NpuInitInjectorRule().apply(p.read_text(), finding)
+        lines = result.splitlines()
+        idx_torch = lines.index("import torch")
+        idx_npu = lines.index("import torch_npu")
+        idx_transfer = lines.index("from torch_npu.contrib import transfer_to_npu")
+        assert idx_torch + 1 == idx_npu
+        assert idx_npu + 1 == idx_transfer
+
+    def test_idempotent_both_present(self, tmp_path: Path) -> None:
+        code = "import torch\nimport torch_npu\nfrom torch_npu.contrib import transfer_to_npu\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.TORCH_IMPORT)
+        result = NpuInitInjectorRule().apply(p.read_text(), finding)
+        assert result == code  # unchanged
+
+    def test_partial_idempotent_missing_transfer(self, tmp_path: Path) -> None:
+        code = "import torch\nimport torch_npu\nx = 1\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.TORCH_IMPORT)
+        result = NpuInitInjectorRule().apply(p.read_text(), finding)
+        assert "from torch_npu.contrib import transfer_to_npu" in result
+        assert result.count("import torch_npu") == 1  # no duplication
+
+    def test_from_torch_import(self, tmp_path: Path) -> None:
+        """Should also trigger on `from torch import ...`."""
+        code = "from torch import nn\nx = 1\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.TORCH_IMPORT)
+        result = NpuInitInjectorRule().apply(p.read_text(), finding)
+        assert "import torch_npu" in result
+        assert "from torch_npu.contrib import transfer_to_npu" in result
 
 
 class TestNcclRule:
@@ -211,6 +388,69 @@ class TestFloat64Rule:
 # Integration: apply migrations
 # ---------------------------------------------------------------------------
 
+class TestCudaAmpRule:
+    def test_import_as_alias(self, tmp_path: Path) -> None:
+        """import torch.cuda.amp as amp → import torch.amp as amp"""
+        p = _write(tmp_path, "a.py", "import torch.cuda.amp as amp\n")
+        finding = _finding(str(p), 1, PatternType.CUDA_AMP)
+        result = CudaAmpRule().apply(p.read_text(), finding)
+        assert "import torch.amp as amp" in result
+        assert "torch.cuda.amp" not in result
+
+    def test_from_import(self, tmp_path: Path) -> None:
+        """from torch.cuda.amp import autocast → from torch.amp import autocast"""
+        p = _write(tmp_path, "a.py", "from torch.cuda.amp import autocast, GradScaler\n")
+        finding = _finding(str(p), 1, PatternType.CUDA_AMP)
+        result = CudaAmpRule().apply(p.read_text(), finding)
+        assert "from torch.amp import autocast, GradScaler" in result
+        assert "torch.cuda.amp" not in result
+
+    def test_inline_usage(self, tmp_path: Path) -> None:
+        """torch.cuda.amp.autocast() → torch.amp.autocast('npu')"""
+        p = _write(tmp_path, "a.py", "with torch.cuda.amp.autocast():\n    pass\n")
+        finding = _finding(str(p), 1, PatternType.CUDA_AMP)
+        result = CudaAmpRule().apply(p.read_text(), finding)
+        assert "torch.cuda.amp" not in result
+
+
+class TestAutocastDeviceRule:
+    def test_inject_npu_device_type_context_manager(self, tmp_path: Path) -> None:
+        """amp.autocast(dtype=self.dtype) → amp.autocast('npu', dtype=self.dtype)"""
+        code = "import torch.amp as amp\nwith amp.autocast(dtype=self.dtype):\n    pass\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 2, PatternType.AUTOCAST_NO_DEVICE)
+        result = AutocastDeviceRule().apply(code, finding)
+        assert "amp.autocast('npu', dtype=self.dtype)" in result
+
+    def test_inject_npu_device_type_decorator(self, tmp_path: Path) -> None:
+        """@amp.autocast(enabled=False) → @amp.autocast('npu', enabled=False)"""
+        code = "import torch.amp as amp\n@amp.autocast(enabled=False)\ndef foo(): pass\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 2, PatternType.AUTOCAST_NO_DEVICE)
+        result = AutocastDeviceRule().apply(code, finding)
+        assert "amp.autocast('npu', enabled=False)" in result
+
+    def test_inject_npu_torch_amp_autocast(self, tmp_path: Path) -> None:
+        """torch.amp.autocast(dtype=...) → torch.amp.autocast('npu', dtype=...)"""
+        code = "with torch.amp.autocast(dtype=torch.bfloat16):\n    pass\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.AUTOCAST_NO_DEVICE)
+        result = AutocastDeviceRule().apply(code, finding)
+        assert "torch.amp.autocast('npu', dtype=torch.bfloat16)" in result
+
+    def test_idempotent_already_has_device(self, tmp_path: Path) -> None:
+        """Already has 'npu' → is_already_applied returns True."""
+        code = "with amp.autocast('npu', dtype=self.dtype):\n    pass\n"
+        finding = _finding("a.py", 1, PatternType.AUTOCAST_NO_DEVICE)
+        assert AutocastDeviceRule().is_already_applied(code, finding) is True
+
+    def test_not_idempotent_missing_device(self, tmp_path: Path) -> None:
+        """Missing device_type → is_already_applied returns False."""
+        code = "with amp.autocast(dtype=self.dtype):\n    pass\n"
+        finding = _finding("a.py", 1, PatternType.AUTOCAST_NO_DEVICE)
+        assert AutocastDeviceRule().is_already_applied(code, finding) is False
+
+
 class TestApplyMigration:
     def test_add_torch_npu_import(self, tmp_path: Path) -> None:
         p = _write(tmp_path, "a.py", "import torch\nx = 1\n")
@@ -218,11 +458,40 @@ class TestApplyMigration:
         assert added is True
         content = p.read_text()
         assert "import torch_npu" in content
+        assert "from torch_npu.contrib import transfer_to_npu" in content
 
     def test_add_torch_npu_import_idempotent(self, tmp_path: Path) -> None:
-        p = _write(tmp_path, "a.py", "import torch\nimport torch_npu\nx = 1\n")
+        p = _write(tmp_path, "a.py", "import torch\nimport torch_npu\nfrom torch_npu.contrib import transfer_to_npu\nx = 1\n")
         added = add_torch_npu_import(str(p))
         assert added is False
+
+    def test_add_torch_npu_import_injection_order(self, tmp_path: Path) -> None:
+        """import torch_npu must come before transfer_to_npu, both after import torch."""
+        p = _write(tmp_path, "a.py", "import torch\nimport os\n")
+        add_torch_npu_import(str(p))
+        lines = p.read_text().splitlines()
+        idx_torch = lines.index("import torch")
+        idx_npu = lines.index("import torch_npu")
+        idx_transfer = lines.index("from torch_npu.contrib import transfer_to_npu")
+        assert idx_torch < idx_npu < idx_transfer
+
+    def test_add_torch_npu_import_partial_idempotent(self, tmp_path: Path) -> None:
+        """If torch_npu exists but transfer_to_npu is missing, inject only the missing line."""
+        p = _write(tmp_path, "a.py", "import torch\nimport torch_npu\nx = 1\n")
+        added = add_torch_npu_import(str(p))
+        assert added is True
+        content = p.read_text()
+        assert "from torch_npu.contrib import transfer_to_npu" in content
+        # torch_npu should NOT be duplicated
+        assert content.count("import torch_npu") == 1
+
+    def test_add_torch_npu_import_full_idempotent(self, tmp_path: Path) -> None:
+        """If both lines already present, return False and don't modify."""
+        code = "import torch\nimport torch_npu\nfrom torch_npu.contrib import transfer_to_npu\nx = 1\n"
+        p = _write(tmp_path, "a.py", code)
+        added = add_torch_npu_import(str(p))
+        assert added is False
+        assert p.read_text() == code  # unchanged
 
     def test_plan_migrations_grouping(self) -> None:
         registry = create_default_registry()
@@ -264,6 +533,14 @@ class TestApplyMigration:
         apply_all_migrations(plan)
         assert (tmp_path / "a.py.bak").exists()
 
+    def test_cuda_amp_rule_in_default_registry(self) -> None:
+        """CUDA_AMP pattern must have a matching rule in the default registry."""
+        registry = create_default_registry()
+        finding = _finding("/tmp/x.py", 1, PatternType.CUDA_AMP)
+        rule = registry.match(finding)
+        assert rule is not None, "No rule matched for CUDA_AMP"
+        assert rule.name == "cuda_amp"
+
     def test_custom_rule_plugin(self, tmp_path: Path) -> None:
         """Register a user-defined rule and verify it's applied."""
 
@@ -271,6 +548,13 @@ class TestApplyMigration:
             name = "custom_bfloat16"
             description = "bfloat16 → float16"
             pattern_type = PatternType.BFLOAT16
+
+            def is_already_applied(self, source: str, finding: Finding) -> bool:
+                lines = source.splitlines()
+                idx = finding.line_number - 1
+                if 0 <= idx < len(lines):
+                    return "bfloat16" not in lines[idx]
+                return False
 
             def apply(self, source: str, finding: Finding) -> str:
                 lines = source.splitlines(keepends=True)
@@ -297,3 +581,291 @@ class TestApplyMigration:
         assert results[0].success is True
         assert "float16" in p.read_text()
         assert "bfloat16" not in p.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Idempotency tests
+# ---------------------------------------------------------------------------
+
+class TestIdempotencyGuards:
+    """Each rule, when applied twice, should produce identical output."""
+
+    def test_is_already_applied_base_class_is_abstract(self) -> None:
+        """MigrationRule.is_already_applied() is abstract."""
+        assert "is_already_applied" in MigrationRule.__abstractmethods__
+
+    def test_cuda_call_idempotent(self, tmp_path: Path) -> None:
+        p = _write(tmp_path, "a.py", "x = tensor.cuda()\n")
+        finding = _finding(str(p), 1, PatternType.CUDA_CALL)
+        rule = CudaCallRule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+        second = rule.apply(first, finding)
+        assert first == second
+
+    def test_cuda_to_idempotent(self, tmp_path: Path) -> None:
+        p = _write(tmp_path, "a.py", 'model.to("cuda")\n')
+        finding = _finding(str(p), 1, PatternType.CUDA_TO)
+        rule = CudaToRule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+
+    def test_cuda_api_idempotent(self, tmp_path: Path) -> None:
+        p = _write(tmp_path, "a.py", "if torch.cuda.is_available():\n    pass\n")
+        finding = _finding(str(p), 1, PatternType.CUDA_API)
+        rule = CudaApiRule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+
+    def test_nccl_idempotent(self, tmp_path: Path) -> None:
+        p = _write(tmp_path, "a.py", 'dist.init_process_group(backend="nccl")\n')
+        finding = _finding(str(p), 1, PatternType.NCCL)
+        rule = NcclToHcclRule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+
+    def test_flash_attn_idempotent(self, tmp_path: Path) -> None:
+        p = _write(tmp_path, "a.py", "import flash_attn\n")
+        finding = _finding(str(p), 1, PatternType.FLASH_ATTN)
+        rule = FlashAttnRule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+
+    def test_flash_attn_skips_try_except_guard(self, tmp_path: Path) -> None:
+        """FlashAttnRule must NOT fire when import is inside try/except with fallback."""
+        code = (
+            "try:\n"
+            "    import flash_attn\n"
+            "    FLASH_ATTN_2_AVAILABLE = True\n"
+            "except (ModuleNotFoundError, ImportError):\n"
+            "    FLASH_ATTN_2_AVAILABLE = False\n"
+            "    flash_attn = None\n"
+        )
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 2, PatternType.FLASH_ATTN, "import flash_attn")
+        rule = FlashAttnRule()
+        assert rule.is_already_applied(code, finding)
+
+    def test_xformers_idempotent(self, tmp_path: Path) -> None:
+        p = _write(tmp_path, "a.py", "import xformers\n")
+        finding = _finding(str(p), 1, PatternType.XFORMERS)
+        rule = XformersRule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+
+    def test_cuda_amp_idempotent(self, tmp_path: Path) -> None:
+        p = _write(tmp_path, "a.py", "from torch.cuda.amp import autocast\n")
+        finding = _finding(str(p), 1, PatternType.CUDA_AMP)
+        rule = CudaAmpRule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+
+    def test_cuda_device_str_idempotent(self, tmp_path: Path) -> None:
+        p = _write(tmp_path, "a.py", 'device = torch.device("cuda")\n')
+        finding = _finding(str(p), 1, PatternType.CUDA_DEVICE_STR)
+        rule = CudaDeviceStrRule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+
+    def test_npu_init_injector_idempotent(self, tmp_path: Path) -> None:
+        p = _write(tmp_path, "a.py", "import torch\nx = 1\n")
+        finding = _finding(str(p), 1, PatternType.TORCH_IMPORT)
+        rule = NpuInitInjectorRule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+        second = rule.apply(first, finding)
+        assert first == second
+
+    def test_float64_idempotent(self, tmp_path: Path) -> None:
+        p = _write(tmp_path, "a.py", "x = x.to(torch.float64)\n")
+        finding = _finding(str(p), 1, PatternType.FLOAT64)
+        rule = Float64Rule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+
+    def test_autocast_dtype_idempotent(self, tmp_path: Path) -> None:
+        p = _write(tmp_path, "a.py", "with torch.amp.autocast('npu', dtype=torch.float32):\n    pass\n")
+        finding = _finding(str(p), 1, PatternType.AUTOCAST_DTYPE)
+        rule = AutocastDtypeRule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+
+    def test_dtype_assert_idempotent(self, tmp_path: Path) -> None:
+        code = "assert e.dtype == torch.float32\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.DTYPE_ASSERT, snippet=code.strip())
+        rule = DtypeAssertRule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+
+    def test_apply_migration_skips_already_applied(self, tmp_path: Path) -> None:
+        """apply_migration() should skip rules that are already applied."""
+        # Pre-migrated file (already has .npu())
+        p = _write(tmp_path, "a.py", "x = tensor.npu()\n")
+        finding = _finding(str(p), 1, PatternType.CUDA_CALL)
+        rule = CudaCallRule()
+        result = apply_migration(str(p), [(finding, rule)])
+        assert result.success is True
+        # Rule was skipped — no rules actually applied
+        assert "cuda_call" not in result.applied_rules
+        # Content unchanged
+        assert p.read_text() == "x = tensor.npu()\n"
+
+
+# ---------------------------------------------------------------------------
+# Step 3: FlashAttnUsageRule tests
+# ---------------------------------------------------------------------------
+
+class TestFlashAttnUsageRule:
+    def test_flash_attn_usage_rule_removes_assert(self, tmp_path: Path) -> None:
+        code = "assert FLASH_ATTN_2_AVAILABLE\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.FLASH_ATTN_USAGE, code.strip())
+        rule = FlashAttnUsageRule()
+        result = rule.apply(p.read_text(), finding)
+        assert not result.startswith("assert")
+        assert "pass" in result
+        assert "[NPU]" in result
+
+    def test_flash_attn_varlen_replaced_with_npu_fusion(self, tmp_path: Path) -> None:
+        """Varlen calls should be replaced with _npu_varlen_attention, NOT SDPA."""
+        code = "out = flash_attn.flash_attn_varlen_func(q, k, v)\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.FLASH_ATTN_USAGE, code.strip())
+        rule = FlashAttnUsageRule()
+        result = rule.apply(p.read_text(), finding)
+        assert "_npu_varlen_attention(" in result
+        assert "# [NPU]" in result
+        assert "flash_attn.flash_attn_varlen_func" not in result.replace("# [NPU]", "")
+
+    def test_flash_attn_usage_rule_idempotent(self, tmp_path: Path) -> None:
+        code = "assert FLASH_ATTN_2_AVAILABLE\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.FLASH_ATTN_USAGE, code.strip())
+        rule = FlashAttnUsageRule()
+        first = rule.apply(p.read_text(), finding)
+        assert rule.is_already_applied(first, finding)
+
+    def test_flash_attn_usage_rule_registered(self) -> None:
+        registry = create_default_registry()
+        finding = _finding("/tmp/x.py", 1, PatternType.FLASH_ATTN_USAGE)
+        rule = registry.match(finding)
+        assert rule is not None
+        assert rule.name == "flash_attn_usage"
+
+    def test_flash_attn_usage_multi_line_varlen_replaced_with_npu(self, tmp_path: Path) -> None:
+        """Multi-line varlen call should use _npu_varlen_attention (in-place substitution)."""
+        code = (
+            "    x = flash_attn.flash_attn_varlen_func(\n"
+            "        q=q,\n"
+            "        k=k,\n"
+            "        v=v,\n"
+            "        cu_seqlens_q=cu_q,\n"
+            "        cu_seqlens_k=cu_k,\n"
+            "        max_seqlen_q=lq,\n"
+            "        max_seqlen_k=lk,\n"
+            "        dropout_p=dropout_p,\n"
+            "        softmax_scale=softmax_scale,\n"
+            "        causal=causal,\n"
+            "        deterministic=deterministic).unflatten(0, (b, lq))\n"
+        )
+        p = _write(tmp_path, "attn.py", code)
+        finding = _finding(str(p), 1, PatternType.FLASH_ATTN_USAGE, "flash_attn.flash_attn_varlen_func(")
+        rule = FlashAttnUsageRule()
+        result = rule.apply(code, finding)
+        # In-place substitution: function name replaced, args preserved
+        assert "_npu_varlen_attention(" in result
+        assert "# [NPU]" in result
+        # All original arguments should be preserved (they're on subsequent lines)
+        assert "q=q," in result
+        assert "cu_seqlens_q=cu_q," in result
+        assert "deterministic=deterministic)" in result
+
+    def test_flash_attn_usage_multi_line_varlen_idempotent(self, tmp_path: Path) -> None:
+        """Applying multi-line varlen rule twice should not double-modify."""
+        code = (
+            "    x = flash_attn.flash_attn_varlen_func(\n"
+            "        q=q,\n"
+            "        k=k,\n"
+            "        v=v,\n"
+            "    ).unflatten(0, (b, lq))\n"
+        )
+        p = _write(tmp_path, "attn.py", code)
+        finding = _finding(str(p), 1, PatternType.FLASH_ATTN_USAGE, "flash_attn.flash_attn_varlen_func(")
+        rule = FlashAttnUsageRule()
+        first = rule.apply(code, finding)
+        assert rule.is_already_applied(first, finding)
+
+    def test_flash_attn_usage_multi_line_preserves_chained_method(self, tmp_path: Path) -> None:
+        """Chained .unflatten() after the multi-line call should be preserved (in-place sub)."""
+        code = (
+            "    x = flash_attn.flash_attn_varlen_func(\n"
+            "        q=q,\n"
+            "        k=k,\n"
+            "        v=v,\n"
+            "    ).unflatten(0, (b, lq))\n"
+        )
+        p = _write(tmp_path, "attn.py", code)
+        finding = _finding(str(p), 1, PatternType.FLASH_ATTN_USAGE, "flash_attn.flash_attn_varlen_func(")
+        rule = FlashAttnUsageRule()
+        result = rule.apply(code, finding)
+        # In-place substitution preserves chained method (it's on a later line)
+        assert "unflatten" in result
+
+    def test_flash_attn_non_varlen_still_uses_sdpa(self, tmp_path: Path) -> None:
+        """Non-varlen flash_attn calls should still use SDPA replacement."""
+        code = "out = flash_attn.flash_attn_func(q, k, v)\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 1, PatternType.FLASH_ATTN_USAGE, code.strip())
+        rule = FlashAttnUsageRule()
+        result = rule.apply(p.read_text(), finding)
+        assert "scaled_dot_product_attention" in result
+        assert "# [NPU]" in result
+        # Should NOT use NPU fusion for non-varlen
+        assert "_npu_varlen_attention" not in result
+
+    def test_flash_attn_varlen_wrapper_injected(self, tmp_path: Path) -> None:
+        """Varlen replacement should inject wrapper function (via marker + post-pass)."""
+        from diffusion_agent.tools.code_migrator import _resolve_npu_wrapper_marker
+        code = "import torch\ndef foo():\n    out = flash_attn.flash_attn_varlen_func(q, k, v)\n"
+        p = _write(tmp_path, "a.py", code)
+        finding = _finding(str(p), 3, PatternType.FLASH_ATTN_USAGE, "flash_attn.flash_attn_varlen_func(")
+        rule = FlashAttnUsageRule()
+        result = rule.apply(code, finding)
+        # Marker should be present
+        assert "__NEEDS_NPU_VARLEN_WRAPPER__" in result
+        # Post-pass resolves the marker
+        resolved = _resolve_npu_wrapper_marker(result)
+        assert "def _npu_varlen_attention" in resolved
+        assert "__NEEDS_NPU_VARLEN_WRAPPER__" not in resolved
+
+    def test_flash_attn_varlen_wrapper_has_tnd_layout(self) -> None:
+        """Wrapper function must use input_layout='TND'."""
+        from diffusion_agent.tools.code_migrator import _NPU_VARLEN_WRAPPER
+        assert 'input_layout="TND"' in _NPU_VARLEN_WRAPPER
+
+    def test_flash_attn_varlen_wrapper_has_int32_cast(self) -> None:
+        """Wrapper function must cast cu_seqlens to int32."""
+        from diffusion_agent.tools.code_migrator import _NPU_VARLEN_WRAPPER
+        assert ".to(torch.int32)" in _NPU_VARLEN_WRAPPER
+
+    def test_flash_attn_varlen_wrapper_has_sparse_mode(self) -> None:
+        """Wrapper function must set sparse_mode=3 for causal, 0 for non-causal."""
+        from diffusion_agent.tools.code_migrator import _NPU_VARLEN_WRAPPER
+        assert "sparse_mode = 3" in _NPU_VARLEN_WRAPPER
+        assert "sparse_mode = 0" in _NPU_VARLEN_WRAPPER
+
+    def test_flash_attn_varlen_wrapper_not_duplicated(self, tmp_path: Path) -> None:
+        """If wrapper already exists in file, marker resolution should not duplicate it."""
+        from diffusion_agent.tools.code_migrator import (
+            _NPU_WRAPPER_MARKER,
+            _resolve_npu_wrapper_marker,
+        )
+        code = (
+            "import torch\n"
+            + "def _npu_varlen_attention(*args, **kwargs): pass\n"
+            + _NPU_WRAPPER_MARKER + "\n"
+            + "def foo(): pass\n"
+        )
+        result = _resolve_npu_wrapper_marker(code)
+        assert result.count("def _npu_varlen_attention") == 1
