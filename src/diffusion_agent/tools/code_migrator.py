@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from diffusion_agent.tools.code_scanner import Finding, PatternType
 from diffusion_agent.utils.logging import get_logger
@@ -734,6 +736,254 @@ class AutocastDeviceRule(MigrationRule):
         return "".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Dependency migration (requirements.txt)
+# ---------------------------------------------------------------------------
+
+# Package name normalization: pip treats - and _ as equivalent
+_PKG_NAME_RE = re.compile(r"^([A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?)")
+
+
+def _normalize_pkg(name: str) -> str:
+    """Normalize package name for comparison (lowercase, replace - with _)."""
+    return name.lower().replace("-", "_")
+
+
+def _parse_pkg_name(line: str) -> str | None:
+    """Extract package name from a requirements.txt line. Returns None for comments/blanks."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or stripped.startswith("-"):
+        return None
+    m = _PKG_NAME_RE.match(stripped)
+    return m.group(1) if m else None
+
+
+def _parse_version_spec(line: str, pkg_name: str) -> str | None:
+    """Extract version specifier from a requirements line (e.g. '>=2.1.0' from 'torch>=2.1.0')."""
+    stripped = line.strip()
+    after_name = stripped[len(pkg_name):]
+    # Match ==, >=, <=, ~=, !=, >, <
+    m = re.match(r"[=<>!~]+(.+)", after_name.strip())
+    return m.group(1).strip() if m else None
+
+
+def _extract_base_version(version_str: str) -> str | None:
+    """Extract major.minor.patch from a version string like '2.1.0.post2'."""
+    m = re.match(r"(\d+\.\d+\.\d+)", version_str)
+    return m.group(1) if m else None
+
+
+@runtime_checkable
+class VersionResolver(Protocol):
+    """Resolves available versions for a package from a package index."""
+
+    def get_available_versions(self, package: str) -> list[str]:
+        """Return available versions sorted newest-first."""
+        ...
+
+
+class PipVersionResolver:
+    """Resolve versions via ``pip index versions <pkg>``."""
+
+    def get_available_versions(self, package: str) -> list[str]:
+        try:
+            result = subprocess.run(
+                ["pip", "index", "versions", package],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                return []
+            # Output: "torch-npu (2.5.0)\n  Available versions: 2.5.0, 2.4.0, 2.3.0, ..."
+            for output_line in result.stdout.splitlines():
+                if "Available versions:" in output_line:
+                    versions_str = output_line.split("Available versions:")[-1]
+                    return [v.strip() for v in versions_str.split(",") if v.strip()]
+            return []
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return []
+
+
+class StaticVersionResolver:
+    """Injectable version resolver for tests."""
+
+    def __init__(self, versions: dict[str, list[str]]) -> None:
+        self._versions = versions
+
+    def get_available_versions(self, package: str) -> list[str]:
+        return self._versions.get(package, [])
+
+
+class DependencyMigrationRule(MigrationRule):
+    """Migrate requirements.txt: prune NVIDIA packages, add NPU essentials, align torch versions.
+
+    Operates on dependency manifest files (requirements.txt) rather than Python source.
+    """
+
+    name = "dependency_migration"
+    description = "Prune NVIDIA deps, add NPU essentials, align torch/torch-npu versions"
+    pattern_type = PatternType.DEPENDENCY_FILE
+
+    # Packages to unconditionally remove
+    BLACKLIST: frozenset[str] = frozenset({
+        "flash_attn", "flash-attn",
+        "xformers",
+        "triton",
+        "accelerate",
+    })
+    BLACKLIST_NORMALIZED: frozenset[str] = frozenset(
+        _normalize_pkg(p) for p in BLACKLIST
+    )
+
+    # Packages to ensure present (value = version pin or None for latest)
+    REQUIRED: dict[str, str | None] = {
+        "imageio-ffmpeg": None,
+    }
+
+    def __init__(self, version_resolver: VersionResolver | None = None) -> None:
+        self._resolver = version_resolver or PipVersionResolver()
+
+    def is_already_applied(self, source: str, finding: Finding) -> bool:
+        lines = source.splitlines()
+
+        # Check 1: No blacklisted packages remain
+        for line in lines:
+            pkg = _parse_pkg_name(line)
+            if pkg and _normalize_pkg(pkg) in self.BLACKLIST_NORMALIZED:
+                return False
+
+        # Check 2: All required packages present
+        present = {_normalize_pkg(p) for line in lines if (p := _parse_pkg_name(line))}
+        for req_pkg in self.REQUIRED:
+            if _normalize_pkg(req_pkg) not in present:
+                return False
+
+        # Check 3: torch-npu present if torch is present
+        if "torch" in present and "torch_npu" not in present:
+            return False
+
+        return True
+
+    def apply(self, source: str, finding: Finding) -> str:
+        lines = source.splitlines()
+        result_lines: list[str] = []
+        removed_pkgs: list[str] = []
+        torch_version: str | None = None
+        has_torch_npu = False
+        present_pkgs: set[str] = set()
+
+        # First pass: collect metadata
+        for line in lines:
+            pkg = _parse_pkg_name(line)
+            if pkg:
+                norm = _normalize_pkg(pkg)
+                present_pkgs.add(norm)
+                if norm == "torch":
+                    torch_version = _parse_version_spec(line, pkg)
+                if norm == "torch_npu":
+                    has_torch_npu = True
+
+        # Second pass: filter and transform
+        for line in lines:
+            pkg = _parse_pkg_name(line)
+            if pkg and _normalize_pkg(pkg) in self.BLACKLIST_NORMALIZED:
+                removed_pkgs.append(pkg)
+                result_lines.append(f"# [NPU] removed: {line.strip()}")
+                continue
+            result_lines.append(line)
+
+        # Version alignment: torch + torch-npu
+        if "torch" in present_pkgs and torch_version:
+            base_ver = _extract_base_version(torch_version)
+            if base_ver:
+                best_npu_ver = self._find_best_npu_version(base_ver)
+                if best_npu_ver:
+                    best_npu_base = _extract_base_version(best_npu_ver)
+                    # Pin torch to aligned version if needed
+                    if best_npu_base and best_npu_base != base_ver:
+                        result_lines = self._replace_torch_version(result_lines, best_npu_base)
+                    # Add or update torch-npu
+                    npu_line = f"torch-npu=={best_npu_ver}"
+                    if has_torch_npu:
+                        result_lines = self._replace_torch_npu_line(result_lines, npu_line)
+                    else:
+                        result_lines.append(npu_line)
+                elif not has_torch_npu:
+                    # No versions available from resolver, add torch-npu with matching base version
+                    result_lines.append(f"torch-npu=={base_ver}.*")
+        elif "torch" in present_pkgs and not has_torch_npu:
+            # torch present without version spec — just add torch-npu
+            result_lines.append("torch-npu")
+
+        # Add missing required packages
+        for req_pkg, req_ver in self.REQUIRED.items():
+            if _normalize_pkg(req_pkg) not in present_pkgs:
+                if req_ver:
+                    result_lines.append(f"{req_pkg}=={req_ver}")
+                else:
+                    result_lines.append(req_pkg)
+
+        return "\n".join(result_lines) + "\n" if result_lines else ""
+
+    def _find_best_npu_version(self, torch_base_ver: str) -> str | None:
+        """Find the best torch-npu version matching the given torch base version."""
+        available = self._resolver.get_available_versions("torch-npu")
+        if not available:
+            return None
+
+        # Exact prefix match first
+        exact_matches = [v for v in available if v.startswith(torch_base_ver)]
+        if exact_matches:
+            return exact_matches[0]  # newest first
+
+        # No exact match — find closest higher version
+        from packaging.version import Version, InvalidVersion
+
+        try:
+            target = Version(torch_base_ver)
+        except InvalidVersion:
+            return available[0] if available else None
+
+        higher: list[tuple[Version, str]] = []
+        for v_str in available:
+            try:
+                v = Version(v_str)
+                if v >= target:
+                    higher.append((v, v_str))
+            except InvalidVersion:
+                continue
+
+        if higher:
+            higher.sort(key=lambda x: x[0])
+            return higher[0][1]  # closest higher
+
+        # All available are lower — return newest
+        return available[0]
+
+    @staticmethod
+    def _replace_torch_version(lines: list[str], new_base: str) -> list[str]:
+        """Replace the torch version pin in the lines list."""
+        result = []
+        for line in lines:
+            pkg = _parse_pkg_name(line)
+            if pkg and _normalize_pkg(pkg) == "torch":
+                result.append(f"torch=={new_base}")
+            else:
+                result.append(line)
+        return result
+
+    @staticmethod
+    def _replace_torch_npu_line(lines: list[str], new_line: str) -> list[str]:
+        """Replace the torch-npu line in the lines list."""
+        result = []
+        for line in lines:
+            pkg = _parse_pkg_name(line)
+            if pkg and _normalize_pkg(pkg) == "torch_npu":
+                result.append(new_line)
+            else:
+                result.append(line)
+        return result
+
+
 class Float64Rule(MigrationRule):
     name = "float64"
     description = "torch.float64/.double() → torch.float32 + warning"
@@ -765,6 +1015,7 @@ class Float64Rule(MigrationRule):
 # ---------------------------------------------------------------------------
 
 _BUILTIN_RULES: list[type[MigrationRule]] = [
+    DependencyMigrationRule,
     CudaCallRule,
     CudaToRule,
     CudaApiRule,

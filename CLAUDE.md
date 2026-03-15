@@ -103,11 +103,15 @@
 | 模型权重路径 | `/data/models/Wan2.2-TI2V-5B/` |
 | Agent LLM 后端 | DeepSeek API (`https://api.deepseek.com/v1`) |
 | LLM 模型 | `deepseek-reasoner` |
-| LLM API Key | `sk-7d18b586c74b4edca414e78f58eb1675` |
+| LLM API Key | 见项目根目录 `.env` 文件（已加入 `.gitignore`） |
 
-对应环境变量（运行 `scripts/run_wan2_adapt.py` 前设置）：
+对应环境变量（运行 `scripts/run_wan2_adapt.py` 前加载）：
 ```bash
-export DA_LLM_API_KEY="sk-7d18b586c74b4edca414e78f58eb1675"
+# 方式一：直接 source .env 文件
+set -a && source .env && set +a
+
+# 方式二：手动 export（值见 .env 文件）
+export DA_LLM_API_KEY="<见 .env>"
 export DA_LLM_BASE_URL="https://api.deepseek.com/v1"
 export DA_LLM_MODEL="deepseek-reasoner"
 export DA_LLM_PROVIDER="openai"

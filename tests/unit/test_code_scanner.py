@@ -6,6 +6,7 @@ from pathlib import Path
 
 from diffusion_agent.tools.code_scanner import (
     PatternType,
+    scan_dependency_files,
     scan_directory,
     scan_file,
 )
@@ -436,3 +437,61 @@ class TestAutocastNoDevice:
         findings = scan_file(src)
         hits = [f for f in findings if f.pattern_type == PatternType.AUTOCAST_NO_DEVICE]
         assert len(hits) == 0
+
+
+# ---------------------------------------------------------------------------
+# PatternType: DEPENDENCY_FILE
+# ---------------------------------------------------------------------------
+
+class TestDependencyFileScanning:
+    def test_scan_finds_requirements_txt(self, tmp_path: Path) -> None:
+        req = tmp_path / "requirements.txt"
+        req.write_text("torch>=2.1.0\nnumpy\n")
+        findings = scan_dependency_files(tmp_path)
+        assert len(findings) == 1
+        assert findings[0].pattern_type == PatternType.DEPENDENCY_FILE
+        assert findings[0].code_snippet == "torch>=2.1.0"
+
+    def test_scan_finds_nested_requirements(self, tmp_path: Path) -> None:
+        req_dir = tmp_path / "requirements"
+        req_dir.mkdir()
+        (req_dir / "base.txt").write_text("torch>=2.1.0\n")
+        (req_dir / "dev.txt").write_text("pytest\n")
+        findings = scan_dependency_files(tmp_path)
+        assert len(findings) == 2
+        file_paths = {f.file_path for f in findings}
+        assert str(req_dir / "base.txt") in file_paths
+        assert str(req_dir / "dev.txt") in file_paths
+
+    def test_scan_finds_requirements_dash_pattern(self, tmp_path: Path) -> None:
+        req = tmp_path / "requirements-dev.txt"
+        req.write_text("pytest\nruff\n")
+        findings = scan_dependency_files(tmp_path)
+        assert len(findings) == 1
+        assert findings[0].file_path == str(req)
+
+    def test_scan_ignores_empty_file(self, tmp_path: Path) -> None:
+        req = tmp_path / "requirements.txt"
+        req.write_text("")
+        findings = scan_dependency_files(tmp_path)
+        assert len(findings) == 0
+
+    def test_scan_ignores_whitespace_only_file(self, tmp_path: Path) -> None:
+        req = tmp_path / "requirements.txt"
+        req.write_text("   \n\n  \n")
+        findings = scan_dependency_files(tmp_path)
+        assert len(findings) == 0
+
+    def test_scan_directory_includes_deps_by_default(self, tmp_path: Path) -> None:
+        (tmp_path / "a.py").write_text("import torch\n")
+        (tmp_path / "requirements.txt").write_text("torch>=2.1.0\n")
+        findings = scan_directory(tmp_path)
+        dep_findings = [f for f in findings if f.pattern_type == PatternType.DEPENDENCY_FILE]
+        assert len(dep_findings) == 1
+
+    def test_scan_directory_excludes_deps_when_disabled(self, tmp_path: Path) -> None:
+        (tmp_path / "a.py").write_text("import torch\n")
+        (tmp_path / "requirements.txt").write_text("torch>=2.1.0\n")
+        findings = scan_directory(tmp_path, include_deps=False)
+        dep_findings = [f for f in findings if f.pattern_type == PatternType.DEPENDENCY_FILE]
+        assert len(dep_findings) == 0

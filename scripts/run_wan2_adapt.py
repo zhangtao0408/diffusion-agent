@@ -46,12 +46,10 @@ def main() -> None:
         print(f"ERROR: Target repo not found at {target_repo}")
         sys.exit(1)
 
-    # ---- Clean reset DISABLED for V11 incremental E2E ----
-    # We preserve V10 progress to test idempotency + rescan loop
-    # print("[+] Resetting target repo to clean main branch...")
-    # reset_to_clean_main(target_repo)
-    # print("[+] Target repo reset complete.")
-    print("[+] Incremental mode: preserving V15 progress (reset disabled for V16)")
+    # ---- Clean reset for V18 full E2E ----
+    print("[+] Resetting target repo to clean main branch...")
+    reset_to_clean_main(target_repo)
+    print("[+] Target repo reset complete.")
 
     # ---- LLM setup ----
     llm = None

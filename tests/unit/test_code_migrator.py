@@ -12,6 +12,7 @@ from diffusion_agent.tools.code_migrator import (
     CudaCallRule,
     CudaDeviceStrRule,
     CudaToRule,
+    DependencyMigrationRule,
     DtypeAssertRule,
     Float64Rule,
     FlashAttnRule,
@@ -20,6 +21,7 @@ from diffusion_agent.tools.code_migrator import (
     NcclToHcclRule,
     NpuInitInjectorRule,
     RuleRegistry,
+    StaticVersionResolver,
     XformersRule,
     add_torch_npu_import,
     apply_all_migrations,
@@ -94,7 +96,7 @@ class TestRuleRegistry:
 
     def test_default_registry_has_all_builtins(self) -> None:
         registry = create_default_registry()
-        assert len(registry.get_rules()) == 14
+        assert len(registry.get_rules()) == 15
 
 
 # ---------------------------------------------------------------------------
@@ -869,3 +871,148 @@ class TestFlashAttnUsageRule:
         )
         result = _resolve_npu_wrapper_marker(code)
         assert result.count("def _npu_varlen_attention") == 1
+
+
+# ---------------------------------------------------------------------------
+# DependencyMigrationRule tests
+# ---------------------------------------------------------------------------
+
+class TestDependencyMigrationRule:
+    """Tests for the DependencyMigrationRule (requirements.txt migration)."""
+
+    @staticmethod
+    def _dep_finding(file_path: str) -> Finding:
+        return Finding(
+            file_path=file_path, line_number=1,
+            pattern_type=PatternType.DEPENDENCY_FILE, code_snippet="",
+        )
+
+    def test_removes_blacklisted_packages(self, tmp_path: Path) -> None:
+        content = "torch>=2.1.0\nflash-attn\nxformers\ntriton\naccelerate\nnumpy\n"
+        rule = DependencyMigrationRule(version_resolver=StaticVersionResolver({}))
+        result = rule.apply(content, self._dep_finding("requirements.txt"))
+        assert "flash-attn" not in result or "# [NPU] removed:" in result
+        assert "xformers" not in result or "# [NPU] removed:" in result
+        assert "triton" not in result or "# [NPU] removed:" in result
+        assert "accelerate" not in result or "# [NPU] removed:" in result
+        assert "numpy" in result
+        # Verify removal comments
+        assert result.count("# [NPU] removed:") == 4
+
+    def test_removes_flash_attn_underscore(self, tmp_path: Path) -> None:
+        content = "flash_attn>=2.0\nnumpy\n"
+        rule = DependencyMigrationRule(version_resolver=StaticVersionResolver({}))
+        result = rule.apply(content, self._dep_finding("r.txt"))
+        assert "# [NPU] removed: flash_attn>=2.0" in result
+        assert "numpy" in result
+
+    def test_adds_required_packages(self, tmp_path: Path) -> None:
+        content = "numpy\nscipy\n"
+        rule = DependencyMigrationRule(version_resolver=StaticVersionResolver({}))
+        result = rule.apply(content, self._dep_finding("r.txt"))
+        assert "imageio-ffmpeg" in result
+
+    def test_preserves_comments_and_blanks(self, tmp_path: Path) -> None:
+        content = "# Core dependencies\ntorch>=2.1.0\n\n# Utils\nnumpy\n"
+        rule = DependencyMigrationRule(version_resolver=StaticVersionResolver({}))
+        result = rule.apply(content, self._dep_finding("r.txt"))
+        assert "# Core dependencies" in result
+        assert "# Utils" in result
+
+    def test_version_alignment_exact_match(self, tmp_path: Path) -> None:
+        """When torch==2.1.0 and torch-npu 2.1.0 is available, pin both."""
+        content = "torch==2.1.0\nnumpy\n"
+        resolver = StaticVersionResolver({
+            "torch-npu": ["2.2.0", "2.1.0", "2.0.0"],
+        })
+        rule = DependencyMigrationRule(version_resolver=resolver)
+        result = rule.apply(content, self._dep_finding("r.txt"))
+        assert "torch-npu==2.1.0" in result
+        assert "torch==2.1.0" in result
+
+    def test_version_alignment_no_exact_match_picks_higher(self, tmp_path: Path) -> None:
+        """When torch==2.1.0 but only torch-npu 2.2.0 available, align to 2.2.0."""
+        content = "torch==2.1.0\nnumpy\n"
+        resolver = StaticVersionResolver({
+            "torch-npu": ["2.3.0", "2.2.0"],
+        })
+        rule = DependencyMigrationRule(version_resolver=resolver)
+        result = rule.apply(content, self._dep_finding("r.txt"))
+        assert "torch-npu==2.2.0" in result
+        assert "torch==2.2.0" in result  # torch realigned to match
+
+    def test_version_alignment_with_existing_torch_npu(self, tmp_path: Path) -> None:
+        """When torch-npu already in requirements, update it."""
+        content = "torch==2.1.0\ntorch-npu==2.0.0\nnumpy\n"
+        resolver = StaticVersionResolver({
+            "torch-npu": ["2.1.0", "2.0.0"],
+        })
+        rule = DependencyMigrationRule(version_resolver=resolver)
+        result = rule.apply(content, self._dep_finding("r.txt"))
+        assert "torch-npu==2.1.0" in result
+        assert "torch-npu==2.0.0" not in result
+
+    def test_version_alignment_resolver_failure(self, tmp_path: Path) -> None:
+        """When resolver returns empty list, add torch-npu with wildcard."""
+        content = "torch==2.1.0\nnumpy\n"
+        resolver = StaticVersionResolver({})
+        rule = DependencyMigrationRule(version_resolver=resolver)
+        result = rule.apply(content, self._dep_finding("r.txt"))
+        assert "torch-npu==2.1.0.*" in result
+
+    def test_no_torch_line_skips_version_alignment(self, tmp_path: Path) -> None:
+        """When no torch in requirements, don't add torch-npu."""
+        content = "numpy\nscipy\n"
+        rule = DependencyMigrationRule(version_resolver=StaticVersionResolver({}))
+        result = rule.apply(content, self._dep_finding("r.txt"))
+        assert "torch-npu" not in result
+        assert "imageio-ffmpeg" in result
+
+    def test_torch_without_version_adds_bare_torch_npu(self, tmp_path: Path) -> None:
+        """When torch present without version spec, add bare torch-npu."""
+        content = "torch\nnumpy\n"
+        rule = DependencyMigrationRule(version_resolver=StaticVersionResolver({}))
+        result = rule.apply(content, self._dep_finding("r.txt"))
+        assert "torch-npu" in result
+
+    def test_idempotent_is_already_applied(self, tmp_path: Path) -> None:
+        """After applying, is_already_applied returns True."""
+        content = "torch==2.1.0\nflash-attn\nnumpy\n"
+        resolver = StaticVersionResolver({"torch-npu": ["2.1.0"]})
+        rule = DependencyMigrationRule(version_resolver=resolver)
+        finding = self._dep_finding("r.txt")
+        result = rule.apply(content, finding)
+        assert rule.is_already_applied(result, finding)
+
+    def test_idempotent_second_apply_stable(self, tmp_path: Path) -> None:
+        """Applying twice produces the same result."""
+        content = "torch==2.1.0\nflash-attn\nxformers\nnumpy\n"
+        resolver = StaticVersionResolver({"torch-npu": ["2.1.0"]})
+        rule = DependencyMigrationRule(version_resolver=resolver)
+        finding = self._dep_finding("r.txt")
+        first = rule.apply(content, finding)
+        second = rule.apply(first, finding)
+        assert first == second
+
+    def test_removal_comment_format(self, tmp_path: Path) -> None:
+        """Verify exact format of removal comment."""
+        content = "accelerate>=0.20.0\nnumpy\n"
+        rule = DependencyMigrationRule(version_resolver=StaticVersionResolver({}))
+        result = rule.apply(content, self._dep_finding("r.txt"))
+        assert "# [NPU] removed: accelerate>=0.20.0" in result
+
+    def test_default_registry_includes_dependency_rule(self) -> None:
+        """DependencyMigrationRule is in the default registry."""
+        registry = create_default_registry()
+        finding = self._dep_finding("requirements.txt")
+        rule = registry.match(finding)
+        assert rule is not None
+        assert rule.name == "dependency_migration"
+
+    def test_version_alignment_gte_spec(self, tmp_path: Path) -> None:
+        """torch>=2.1.0 should also trigger version alignment."""
+        content = "torch>=2.1.0\nnumpy\n"
+        resolver = StaticVersionResolver({"torch-npu": ["2.1.0.post2", "2.1.0"]})
+        rule = DependencyMigrationRule(version_resolver=resolver)
+        result = rule.apply(content, self._dep_finding("r.txt"))
+        assert "torch-npu==2.1.0.post2" in result

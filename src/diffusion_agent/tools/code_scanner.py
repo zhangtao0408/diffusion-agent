@@ -31,6 +31,7 @@ class PatternType(str, Enum):
     DTYPE_ASSERT = "dtype_assert"      # assert ... .dtype == torch.float32
     FLASH_ATTN_USAGE = "flash_attn_usage"  # flash_attn assert guards and function calls
     AUTOCAST_NO_DEVICE = "autocast_no_device"  # autocast() missing device_type arg
+    DEPENDENCY_FILE = "dependency_file"  # requirements.txt / dependency manifests
 
 
 @dataclass
@@ -312,10 +313,56 @@ def scan_file(path: Path) -> list[Finding]:
     return visitor.findings
 
 
-def scan_directory(path: Path, pattern: str = "**/*.py") -> list[Finding]:
-    """Recursively scan Python files under *path* for CUDA patterns."""
+def scan_dependency_files(path: Path) -> list[Finding]:
+    """Scan for dependency manifest files (requirements.txt, etc.) under *path*.
+
+    Returns one Finding per discovered file with ``PatternType.DEPENDENCY_FILE``.
+    """
+    findings: list[Finding] = []
+    # Patterns to search for dependency files
+    globs = [
+        "requirements.txt",
+        "requirements/*.txt",
+        "requirements-*.txt",
+        "requirements_*.txt",
+    ]
+    seen: set[Path] = set()
+    for g in globs:
+        for dep_file in sorted(path.glob(g)):
+            resolved = dep_file.resolve()
+            if not dep_file.is_file() or resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                content = dep_file.read_text(encoding="utf-8").strip()
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if not content:
+                continue
+            first_line = content.splitlines()[0]
+            findings.append(
+                Finding(
+                    file_path=str(dep_file),
+                    line_number=1,
+                    pattern_type=PatternType.DEPENDENCY_FILE,
+                    code_snippet=first_line,
+                )
+            )
+    return findings
+
+
+def scan_directory(
+    path: Path, pattern: str = "**/*.py", *, include_deps: bool = True,
+) -> list[Finding]:
+    """Recursively scan Python files under *path* for CUDA patterns.
+
+    When *include_deps* is True (default), also scans for dependency manifest
+    files (``requirements.txt``, etc.) via :func:`scan_dependency_files`.
+    """
     findings: list[Finding] = []
     for py_file in sorted(path.glob(pattern)):
         if py_file.is_file():
             findings.extend(scan_file(py_file))
+    if include_deps:
+        findings.extend(scan_dependency_files(path))
     return findings
