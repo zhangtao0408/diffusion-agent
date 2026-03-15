@@ -134,9 +134,9 @@ src/diffusion_agent/
 - [x] End-to-end integration tests (79 tests total)
 
 ### Phase 2 — Adapt Model to Ascend
-- [ ] Automated `.cuda()` → `.npu()` migrator
-- [ ] LLM-guided migration for complex cases (custom kernels, unsupported ops)
-- [ ] Per-file feature decomposition and commits
+- [x] Automated `.cuda()` → `.npu()` migrator
+- [x] LLM-guided migration for complex cases (custom kernels, unsupported ops)
+- [x] Per-file feature decomposition and commits
 
 ### Phase 3 — Performance Analysis
 - [ ] `torch_npu.npu.profile` and `msprof` integration
