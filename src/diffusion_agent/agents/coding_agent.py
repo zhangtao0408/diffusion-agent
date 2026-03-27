@@ -56,6 +56,14 @@ def coding_node(state: AgentState) -> dict:
         updated_state = scenario_impl.execute(state)
         tool_results = list(updated_state.get("tool_results", []))
         append_log(repo_local, f"Executed feature: {feature.name} (check_support)")
+    elif scenario_name == "adapt":
+        from diffusion_agent.scenarios.adapt import AdaptScenario
+
+        log.info("executing_adapt_scenario", feature=feature.name)
+        scenario_impl = AdaptScenario()
+        updated_state = scenario_impl.execute(state)
+        tool_results = list(updated_state.get("tool_results", []))
+        append_log(repo_local, f"Executed feature: {feature.name} (adapt)")
     else:
         log.info("executing_feature_stub", feature=feature.name)
         append_log(repo_local, f"Executed feature: {feature.name} (stub)")
